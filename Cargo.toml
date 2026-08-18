@@ -1,0 +1,19 @@
+[package]
+name = "tor-browser-builder"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.32"
+egui = "0.32"
+egui_extras = { version = "0.32", features = ["all_loaders"] }
+directories = "5"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
