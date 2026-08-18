@@ -1,7 +1,7 @@
 # Tor Browser Installer
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: AGPL](https://img.shields.io/badge/license-AGPL-blue.svg)](LICENSE)
 
 A **cross-platform** installer and launcher for [Tor Browser](https://www.torproject.org/download/) with a modern, user-friendly UI. Built with Rust and [egui](https://github.com/emilk/egui) for native performance and a clean, approachable interface.
 
