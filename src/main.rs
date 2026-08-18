@@ -37,6 +37,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use directories::UserDirs;
+use sequoia_openpgp as openpgp;
+use openpgp::parse::{Parse, stream::*};
+use openpgp::policy::StandardPolicy;
 
 // ---------------------------------------------------------------------
 // Platform detection
@@ -115,7 +118,7 @@ fn archive_extension() -> &'static str {
 // ---------------------------------------------------------------------
 
 mod palette {
-    #![allow(dead_code)] // Full palette kept around for future UI states.
+    #![allow(dead_code)]
     use egui::Color32;
 
     pub const PURPLE_DARK: Color32 = Color32::from_rgb(66, 12, 93);
@@ -129,6 +132,23 @@ mod palette {
     pub const SUCCESS: Color32 = Color32::from_rgb(24, 163, 90);
     pub const ERROR: Color32 = Color32::from_rgb(200, 45, 60);
     pub const GOLD: Color32 = Color32::from_rgb(214, 168, 40);
+}
+
+mod palette_dark {
+    use egui::Color32;
+
+    pub const BG: Color32 = Color32::from_rgb(18, 18, 24);
+    pub const SURFACE: Color32 = Color32::from_rgb(28, 28, 36);
+    pub const BORDER: Color32 = Color32::from_rgb(50, 50, 65);
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(235, 230, 245);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(160, 155, 170);
+    pub const PURPLE_SOFT: Color32 = Color32::from_rgb(55, 20, 80);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    Light,
+    Dark,
 }
 
 // ---------------------------------------------------------------------
@@ -233,13 +253,25 @@ mod icons {
 enum AppState {
     Idle,
     Checking,
+    AlreadyInstalled {
+        app_path: PathBuf,
+    },
+    ConfirmInstall {
+        version: String,
+        binary_url: String,
+        sha256: Option<String>,
+        sig_url: Option<String>,
+    },
     Downloading {
         progress: f32,
         downloaded_mb: f32,
         total_mb: f32,
     },
     Verifying,
-    Installing,
+    VerifyingSignature,
+    Installing {
+        stage: String,
+    },
     Complete {
         app_path: PathBuf,
     },
@@ -255,6 +287,7 @@ struct ReleaseInfo {
     version: String,
     binary_url: String,
     sha256: Option<String>,
+    sig_url: Option<String>,
 }
 
 struct TorBrowserBuilder {
@@ -262,7 +295,9 @@ struct TorBrowserBuilder {
     installation_path: PathBuf,
     install_path_text: String,
     rx: Option<Receiver<WorkerEvent>>,
+    confirm_tx: Option<Sender<bool>>,
     logo_bytes: &'static [u8],
+    theme: Theme,
 }
 
 impl TorBrowserBuilder {
@@ -282,12 +317,19 @@ impl TorBrowserBuilder {
         let installation_path = default_install_path();
         let install_path_text = installation_path.display().to_string();
 
+        let state = match find_existing_install() {
+            Some(path) => AppState::AlreadyInstalled { app_path: path },
+            None => AppState::Idle,
+        };
+
         Self {
-            state: AppState::Idle,
+            state,
             installation_path,
             install_path_text,
             rx: None,
+            confirm_tx: None,
             logo_bytes: include_bytes!("assets/tor_logo_tbb.svg"),
+            theme: Theme::Light,
         }
     }
 
@@ -297,13 +339,21 @@ impl TorBrowserBuilder {
 
     fn start_download(&mut self) {
         let (tx, rx): (Sender<WorkerEvent>, Receiver<WorkerEvent>) = std::sync::mpsc::channel();
+        let (confirm_tx, confirm_rx): (Sender<bool>, Receiver<bool>) = std::sync::mpsc::channel();
         self.rx = Some(rx);
+        self.confirm_tx = Some(confirm_tx);
         self.state = AppState::Checking;
 
         let install_dir = self.installation_path.clone();
         std::thread::spawn(move || {
-            run_install_pipeline(install_dir, tx);
+            run_install_pipeline(install_dir, tx, confirm_rx);
         });
+    }
+
+    fn send_confirm(&mut self, proceed: bool) {
+        if let Some(tx) = self.confirm_tx.take() {
+            let _ = tx.send(proceed);
+        }
     }
 
     /// Drain any pending worker events. Called once per frame.
@@ -347,7 +397,7 @@ impl TorBrowserBuilder {
 
     fn draw_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.add_space((ui.available_width() - 380.0).max(0.0) / 2.0);
+            ui.add_space((ui.available_width() - 420.0).max(0.0) / 2.0);
             ui.add(
                 egui::Image::from_bytes("bytes://tor_logo_tbb.svg", self.logo_bytes)
                     .fit_to_exact_size(egui::vec2(84.0, 84.0)),
@@ -359,22 +409,41 @@ impl TorBrowserBuilder {
                     RichText::new("Tor Browser")
                         .size(26.0)
                         .strong()
-                        .color(palette::TEXT_PRIMARY),
+                        .color(self.text_primary()),
                 );
                 ui.label(
-                    RichText::new("Builder")
+                    RichText::new("Installer")
                         .size(26.0)
                         .strong()
                         .color(palette::PURPLE),
                 );
             });
+            ui.add_space(ui.available_width().max(0.0));
+            let label = if self.theme == Theme::Light { "\u{263E}" } else { "\u{2600}" };
+            let theme_btn = ui.add(
+                egui::Button::new(
+                    RichText::new(label).size(18.0).color(self.text_primary()),
+                )
+                .fill(self.surface())
+                .stroke(Stroke::new(1.0, self.border()))
+                .corner_radius(egui::CornerRadius::same(8)),
+            );
+            if theme_btn.clicked() {
+                self.theme = match self.theme {
+                    Theme::Light => Theme::Dark,
+                    Theme::Dark => Theme::Light,
+                };
+                self.apply_theme(ui.ctx());
+            }
         });
     }
 
     fn draw_card(&mut self, ui: &mut egui::Ui) {
+        let surface = self.surface();
+        let border = self.border();
         egui::Frame::NONE
-            .fill(palette::SURFACE)
-            .stroke(Stroke::new(1.0_f32, palette::BORDER))
+            .fill(surface)
+            .stroke(Stroke::new(1.0_f32, border))
             .corner_radius(egui::CornerRadius::same(16))
             .inner_margin(egui::Margin::same(28))
             .show(ui, |ui| {
@@ -382,26 +451,105 @@ impl TorBrowserBuilder {
                 match self.state.clone() {
                     AppState::Idle => self.draw_idle(ui),
                     AppState::Checking => Self::draw_checking(ui),
+                    AppState::AlreadyInstalled { ref app_path } => {
+                        self.draw_already_installed(ui, app_path)
+                    }
+                    AppState::ConfirmInstall {
+                        ref version,
+                        ref binary_url,
+                        ref sha256,
+                        ref sig_url,
+                    } => self.draw_confirm(ui, version, binary_url, sha256, sig_url),
                     AppState::Downloading {
                         progress,
                         downloaded_mb,
                         total_mb,
                     } => self.draw_downloading(ui, progress, downloaded_mb, total_mb),
                     AppState::Verifying => Self::draw_verifying(ui),
-                    AppState::Installing => Self::draw_installing(ui),
+                    AppState::VerifyingSignature => Self::draw_verifying_signature(ui),
+                    AppState::Installing { ref stage } => Self::draw_installing(ui, stage),
                     AppState::Complete { app_path } => self.draw_complete(ui, &app_path),
                     AppState::Error(e) => self.draw_error(ui, &e),
                 }
             });
     }
 
+    fn text_primary(&self) -> Color32 {
+        match self.theme {
+            Theme::Light => palette::TEXT_PRIMARY,
+            Theme::Dark => palette_dark::TEXT_PRIMARY,
+        }
+    }
+
+    fn text_secondary(&self) -> Color32 {
+        match self.theme {
+            Theme::Light => palette::TEXT_SECONDARY,
+            Theme::Dark => palette_dark::TEXT_SECONDARY,
+        }
+    }
+
+    fn bg(&self) -> Color32 {
+        match self.theme {
+            Theme::Light => palette::BG,
+            Theme::Dark => palette_dark::BG,
+        }
+    }
+
+    fn surface(&self) -> Color32 {
+        match self.theme {
+            Theme::Light => palette::SURFACE,
+            Theme::Dark => palette_dark::SURFACE,
+        }
+    }
+
+    fn border(&self) -> Color32 {
+        match self.theme {
+            Theme::Light => palette::BORDER,
+            Theme::Dark => palette_dark::BORDER,
+        }
+    }
+
+    fn purple_soft(&self) -> Color32 {
+        match self.theme {
+            Theme::Light => palette::PURPLE_SOFT,
+            Theme::Dark => palette_dark::PURPLE_SOFT,
+        }
+    }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        match self.theme {
+            Theme::Light => {
+                style.visuals.window_fill = palette::BG;
+                style.visuals.panel_fill = palette::BG;
+                style.visuals.selection.bg_fill = palette::PURPLE;
+                style.visuals.selection.stroke.color = palette::PURPLE;
+            }
+            Theme::Dark => {
+                style.visuals.window_fill = palette_dark::BG;
+                style.visuals.panel_fill = palette_dark::BG;
+                style.visuals.selection.bg_fill = palette::PURPLE;
+                style.visuals.selection.stroke.color = palette::PURPLE;
+                style.visuals.widgets.noninteractive.bg_fill = palette_dark::SURFACE;
+                style.visuals.widgets.inactive.bg_fill = palette_dark::SURFACE;
+                style.visuals.widgets.hovered.bg_fill = palette_dark::BORDER;
+                style.visuals.widgets.active.bg_fill = palette_dark::BORDER;
+            }
+        }
+        ctx.set_visuals(style.visuals);
+    }
+
     fn draw_idle(&mut self, ui: &mut egui::Ui) {
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
+        let bg = self.bg();
+        let border_color = self.border();
         ui.vertical(|ui| {
             ui.label(
                 RichText::new("Set up Tor Browser")
                     .size(18.0)
                     .strong()
-                    .color(palette::TEXT_PRIMARY),
+                    .color(text_primary),
             );
             ui.add_space(6.0);
             ui.label(
@@ -410,19 +558,19 @@ impl TorBrowserBuilder {
                      verifies it, and installs it to the folder below.",
                 )
                 .size(14.0)
-                .color(palette::TEXT_SECONDARY),
+                .color(text_secondary),
             );
 
             ui.add_space(18.0);
             ui.label(
                 RichText::new("INSTALL LOCATION")
                     .size(11.0)
-                    .color(palette::TEXT_SECONDARY),
+                    .color(text_secondary),
             );
             ui.add_space(4.0);
             egui::Frame::NONE
-                .fill(palette::BG)
-                .stroke(Stroke::new(1.0_f32, palette::BORDER))
+                .fill(bg)
+                .stroke(Stroke::new(1.0_f32, border_color))
                 .corner_radius(egui::CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
@@ -430,7 +578,7 @@ impl TorBrowserBuilder {
                         egui::TextEdit::singleline(&mut self.install_path_text)
                             .frame(false)
                             .desired_width(f32::INFINITY)
-                            .text_color(palette::TEXT_PRIMARY),
+                            .text_color(text_primary),
                     );
                     if response.changed() {
                         self.installation_path = PathBuf::from(&self.install_path_text);
@@ -465,7 +613,7 @@ impl TorBrowserBuilder {
                 ui.label(
                     RichText::new(format!("Builds a native install for {}", platform_label()))
                         .size(12.5)
-                        .color(palette::TEXT_SECONDARY),
+                        .color(text_secondary),
                 );
             });
         });
@@ -488,6 +636,174 @@ impl TorBrowserBuilder {
         });
     }
 
+    fn draw_already_installed(&mut self, ui: &mut egui::Ui, app_path: &Path) {
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
+        let app_path = app_path.to_path_buf();
+        ui.vertical_centered(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.circle_filled(rect.center(), 28.0, palette::GOLD.gamma_multiply(0.12));
+            icons::lock(painter, rect.center(), 24.0, palette::GOLD);
+
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Tor Browser is already installed")
+                    .size(19.0)
+                    .strong()
+                    .color(text_primary),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("Found at {}", app_path.display()))
+                    .size(13.0)
+                    .color(text_secondary),
+            );
+            ui.add_space(20.0);
+
+            let launch_btn = ui.add_sized(
+                [280.0, 46.0],
+                egui::Button::new("")
+                    .fill(palette::SUCCESS)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(10)),
+            );
+            Self::icon_label_button(ui, &launch_btn, icons::launch, "Launch Tor Browser", Color32::WHITE);
+            if launch_btn.clicked() {
+                launch_app(&app_path);
+            }
+
+            ui.add_space(10.0);
+            let reinstall_btn = ui.add_sized(
+                [280.0, 46.0],
+                egui::Button::new("")
+                    .fill(palette::PURPLE)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(10)),
+            );
+            Self::icon_label_button(
+                ui,
+                &reinstall_btn,
+                icons::download,
+                "Reinstall / Update",
+                Color32::WHITE,
+            );
+            if reinstall_btn.clicked() {
+                self.start_download();
+            }
+        });
+    }
+
+    fn draw_confirm(
+        &mut self,
+        ui: &mut egui::Ui,
+        version: &str,
+        binary_url: &str,
+        sha256: &Option<String>,
+        sig_url: &Option<String>,
+    ) {
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new("Confirm Download")
+                    .size(18.0)
+                    .strong()
+                    .color(text_primary),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Please verify this information before continuing:")
+                    .size(14.0)
+                    .color(text_secondary),
+            );
+
+            ui.add_space(16.0);
+
+            let fields = [
+                ("Version", version.to_string()),
+                ("Binary URL", binary_url.to_string()),
+            ];
+            let sha256_str = sha256
+                .as_deref()
+                .unwrap_or("not available")
+                .to_string();
+            let sig_str = sig_url
+                .as_deref()
+                .unwrap_or("not available")
+                .to_string();
+
+            for (label, value) in fields.iter().chain(
+                [
+                    ("SHA-256", sha256_str),
+                    ("Signature URL", sig_str),
+                ]
+                .iter(),
+            ) {
+                ui.label(
+                    RichText::new(*label)
+                        .size(11.0)
+                        .strong()
+                        .color(text_secondary),
+                );
+                ui.add_space(2.0);
+                egui::Frame::NONE
+                    .fill(self.bg())
+                    .stroke(Stroke::new(1.0, self.border()))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(value)
+                                .size(12.5)
+                                .monospace()
+                                .color(text_primary),
+                        );
+                    });
+                ui.add_space(8.0);
+            }
+
+            ui.add_space(8.0);
+            let continue_btn = ui.add_sized(
+                [ui.available_width(), 46.0],
+                egui::Button::new("")
+                    .fill(palette::PURPLE)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::same(10)),
+            );
+            let rect = continue_btn.rect;
+            let painter = ui.painter();
+            icons::check(painter, egui::pos2(rect.center().x - 50.0, rect.center().y), 16.0, Color32::WHITE);
+            painter.text(
+                egui::pos2(rect.center().x - 30.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "Continue",
+                egui::FontId::proportional(15.5),
+                Color32::WHITE,
+            );
+            if continue_btn.clicked() {
+                self.send_confirm(true);
+            }
+
+            ui.add_space(10.0);
+            let cancel_btn = ui.add_sized(
+                [ui.available_width(), 42.0],
+                egui::Button::new(
+                    RichText::new("Cancel").size(14.0).color(text_secondary),
+                )
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::new(1.0, self.border()))
+                .corner_radius(egui::CornerRadius::same(8)),
+            );
+            if cancel_btn.clicked() {
+                self.send_confirm(false);
+                self.rx = None;
+                self.confirm_tx = None;
+                self.state = AppState::Idle;
+            }
+        });
+    }
+
     fn draw_downloading(
         &mut self,
         ui: &mut egui::Ui,
@@ -495,12 +811,14 @@ impl TorBrowserBuilder {
         downloaded_mb: f32,
         total_mb: f32,
     ) {
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
         ui.vertical(|ui| {
             ui.label(
                 RichText::new("Downloading Tor Browser")
                     .size(18.0)
                     .strong()
-                    .color(palette::TEXT_PRIMARY),
+                    .color(text_primary),
             );
             ui.add_space(16.0);
             ui.add(
@@ -517,7 +835,7 @@ impl TorBrowserBuilder {
                 } else {
                     format!("{downloaded_mb:.1} MB downloaded")
                 };
-                ui.label(RichText::new(detail).size(13.0).color(palette::TEXT_SECONDARY));
+                ui.label(RichText::new(detail).size(13.0).color(text_secondary));
             });
             ui.add_space(16.0);
             if ui
@@ -542,19 +860,36 @@ impl TorBrowserBuilder {
             ui.add(egui::Spinner::new().size(28.0).color(palette::PURPLE));
             ui.add_space(14.0);
             ui.label(
-                RichText::new("Verifying the download")
+                RichText::new("Verifying SHA-256 checksum")
                     .size(16.0)
                     .color(palette::TEXT_PRIMARY),
             );
             ui.label(
-                RichText::new("Checking the file integrity before installing")
+                RichText::new("Checking file integrity before installing")
                     .size(13.0)
                     .color(palette::TEXT_SECONDARY),
             );
         });
     }
 
-    fn draw_installing(ui: &mut egui::Ui) {
+    fn draw_verifying_signature(ui: &mut egui::Ui) {
+        Self::centered_status(ui, |ui| {
+            ui.add(egui::Spinner::new().size(28.0).color(palette::PURPLE));
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new("Verifying PGP signature")
+                    .size(16.0)
+                    .color(palette::TEXT_PRIMARY),
+            );
+            ui.label(
+                RichText::new("Checking the Tor Project's cryptographic signature")
+                    .size(13.0)
+                    .color(palette::TEXT_SECONDARY),
+            );
+        });
+    }
+
+    fn draw_installing(ui: &mut egui::Ui, stage: &str) {
         Self::centered_status(ui, |ui| {
             ui.add(egui::Spinner::new().size(28.0).color(palette::PURPLE));
             ui.add_space(14.0);
@@ -564,7 +899,7 @@ impl TorBrowserBuilder {
                     .color(palette::TEXT_PRIMARY),
             );
             ui.label(
-                RichText::new("Mounting the disk image and copying the app")
+                RichText::new(stage)
                     .size(13.0)
                     .color(palette::TEXT_SECONDARY),
             );
@@ -572,6 +907,8 @@ impl TorBrowserBuilder {
     }
 
     fn draw_complete(&mut self, ui: &mut egui::Ui, app_path: &Path) {
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
         let app_path = app_path.to_path_buf();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
@@ -584,13 +921,13 @@ impl TorBrowserBuilder {
                 RichText::new("Installed")
                     .size(19.0)
                     .strong()
-                    .color(palette::TEXT_PRIMARY),
+                    .color(text_primary),
             );
             ui.add_space(4.0);
             ui.label(
                 RichText::new(format!("Tor Browser is ready at {}", app_path.display()))
                     .size(13.0)
-                    .color(palette::TEXT_SECONDARY),
+                    .color(text_secondary),
             );
             ui.add_space(20.0);
 
@@ -610,7 +947,7 @@ impl TorBrowserBuilder {
             let folder_btn = ui.add_sized(
                 [280.0, 46.0],
                 egui::Button::new("")
-                    .fill(palette::PURPLE_SOFT)
+                    .fill(self.purple_soft())
                     .stroke(Stroke::new(1.0_f32, palette::PURPLE))
                     .corner_radius(egui::CornerRadius::same(10)),
             );
@@ -630,6 +967,8 @@ impl TorBrowserBuilder {
     }
 
     fn draw_error(&mut self, ui: &mut egui::Ui, error: &str) {
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
             let painter = ui.painter();
@@ -641,10 +980,10 @@ impl TorBrowserBuilder {
                 RichText::new("Something went wrong")
                     .size(18.0)
                     .strong()
-                    .color(palette::TEXT_PRIMARY),
+                    .color(text_primary),
             );
             ui.add_space(6.0);
-            ui.label(RichText::new(error).size(13.0).color(palette::TEXT_SECONDARY));
+            ui.label(RichText::new(error).size(13.0).color(text_secondary));
             ui.add_space(18.0);
 
             if ui
@@ -663,14 +1002,15 @@ impl TorBrowserBuilder {
     }
 
     fn draw_footer(&mut self, ui: &mut egui::Ui) {
+        let text_secondary = self.text_secondary();
         ui.horizontal(|ui| {
             ui.add_space((ui.available_width() - 220.0).max(0.0) / 2.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            icons::lock(ui.painter(), rect.center(), 14.0, palette::TEXT_SECONDARY);
+            icons::lock(ui.painter(), rect.center(), 14.0, text_secondary);
             ui.label(
                 RichText::new("Secure  ·  Private  ·  Free")
                     .size(12.5)
-                    .color(palette::TEXT_SECONDARY),
+                    .color(text_secondary),
             );
         });
     }
@@ -710,10 +1050,11 @@ impl TorBrowserBuilder {
 
 impl eframe::App for TorBrowserBuilder {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title("Tor Browser Builder".to_owned()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("Tor Browser Installer".to_owned()));
         self.poll_worker(ctx);
+        let bg = self.bg();
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(palette::BG))
+            .frame(egui::Frame::NONE.fill(bg))
             .show(ctx, |ui| self.draw_app(ui));
     }
 }
@@ -723,7 +1064,11 @@ impl eframe::App for TorBrowserBuilder {
 // This runs on its own thread so the UI stays responsive.
 // ---------------------------------------------------------------------
 
-fn run_install_pipeline(install_dir: PathBuf, tx: Sender<WorkerEvent>) {
+fn run_install_pipeline(
+    install_dir: PathBuf,
+    tx: Sender<WorkerEvent>,
+    confirm_rx: Receiver<bool>,
+) {
     let send_state = |s: AppState| {
         let _ = tx.send(WorkerEvent::State(s));
     };
@@ -737,6 +1082,27 @@ fn run_install_pipeline(install_dir: PathBuf, tx: Sender<WorkerEvent>) {
             return;
         }
     };
+
+    // Ask the user to confirm before downloading
+    send_state(AppState::ConfirmInstall {
+        version: release.version.clone(),
+        binary_url: release.binary_url.clone(),
+        sha256: release.sha256.clone(),
+        sig_url: release.sig_url.clone(),
+    });
+
+    match confirm_rx.recv() {
+        Ok(true) => {}
+        Ok(false) => {
+            return;
+        }
+        Err(_) => {
+            send_state(AppState::Error(
+                "Confirmation channel closed unexpectedly".to_string(),
+            ));
+            return;
+        }
+    }
 
     let tmp_dir = std::env::temp_dir().join("tor-browser-builder");
     if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
@@ -778,9 +1144,24 @@ fn run_install_pipeline(install_dir: PathBuf, tx: Sender<WorkerEvent>) {
         }
     }
 
-    send_state(AppState::Installing);
+    if let Some(sig_url) = &release.sig_url {
+        send_state(AppState::VerifyingSignature);
+        match verify_pgp_signature(&archive_path, sig_url) {
+            Ok(()) => {}
+            Err(e) => {
+                send_state(AppState::Error(format!(
+                    "PGP signature verification failed: {e}"
+                )));
+                return;
+            }
+        }
+    }
 
-    match install_release(&archive_path, &install_dir) {
+    send_state(AppState::Installing {
+        stage: "Preparing installation...".to_string(),
+    });
+
+    match install_release(&archive_path, &install_dir, &tx) {
         Ok(app_path) => send_state(AppState::Complete { app_path }),
         Err(e) => send_state(AppState::Error(format!("Install failed: {e}"))),
     }
@@ -866,10 +1247,23 @@ fn fetch_release_info() -> Result<ReleaseInfo, String> {
         .or_else(|| body.pointer(sha_pointer).and_then(|v| v.as_str()))
         .map(|s| s.to_string());
 
+    // Try to find a signature URL. The Tor Project provides .asc detached
+    // signatures alongside release binaries.
+    let sig_url = body
+        .get("sig")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Fallback: construct the signature URL from the binary URL
+            // by appending ".asc"
+            Some(format!("{binary_url}.asc"))
+        });
+
     Ok(ReleaseInfo {
         version,
         binary_url,
         sha256,
+        sig_url,
     })
 }
 
@@ -932,34 +1326,131 @@ fn sha256_of_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Verifies a detached PGP signature against a file using the
+/// Tor Browser Developers signing key.
+///
+/// Downloads the key from keys.openpgp.org at runtime, then verifies the
+/// .asc detached signature against the downloaded archive.
+fn verify_pgp_signature(file_path: &Path, sig_url: &str) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("tor-browser-builder/0.2")
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // Download the .asc detached signature
+    let sig_bytes = client
+        .get(sig_url)
+        .send()
+        .map_err(|e| format!("failed to download signature: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("signature download failed: {e}"))?
+        .bytes()
+        .map_err(|e| e.to_string())?;
+
+    // Fetch the Tor Browser Developers signing key from keys.openpgp.org
+    // Fingerprint: EF6E286DDA85EA2A4BA7DE684E2C6E8793298290
+    let key_url = "https://keys.openpgp.org/vks/v1/by-fingerprint/EF6E286DDA85EA2A4BA7DE684E2C6E8793298290";
+    let key_bytes = client
+        .get(key_url)
+        .send()
+        .map_err(|e| format!("failed to fetch Tor Browser signing key: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("signing key download failed: {e}"))?
+        .bytes()
+        .map_err(|e| e.to_string())?;
+
+    // Parse the key as an OpenPGP Cert
+    let cert = openpgp::Cert::from_bytes(&key_bytes)
+        .map_err(|e| format!("failed to parse Tor Browser signing key: {e}"))?;
+
+    // Read the file to verify
+    let file_bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
+
+    // Helper that feeds the Tor Browser Developers key to the verifier
+    struct TorKeyHelper {
+        cert: openpgp::Cert,
+    }
+
+    impl VerificationHelper for TorKeyHelper {
+        fn get_certs(&mut self, _ids: &[openpgp::KeyHandle]) -> openpgp::Result<Vec<openpgp::Cert>> {
+            Ok(vec![self.cert.clone()])
+        }
+
+        fn check(&mut self, structure: MessageStructure) -> openpgp::Result<()> {
+            for layer in structure {
+                if let MessageLayer::SignatureGroup { results } = layer {
+                    if results.iter().any(|r| r.is_ok()) {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(anyhow::anyhow!(
+                "No valid signature found from the Tor Browser Developers"
+            ))
+        }
+    }
+
+    let policy = StandardPolicy::new();
+    let helper = TorKeyHelper { cert };
+
+    let mut verifier = DetachedVerifierBuilder::from_bytes(sig_bytes.as_ref())
+        .map_err(|e| format!("failed to parse .asc signature: {e}"))?
+        .with_policy(&policy, None, helper)
+        .map_err(|e| format!("signature verification setup failed: {e}"))?;
+
+    verifier
+        .verify_bytes(file_bytes.as_slice())
+        .map_err(|e| format!("PGP signature verification failed: {e}"))?;
+
+    Ok(())
+}
+
 /// Dispatches to the platform-appropriate install routine. Each build only
 /// compiles the branch matching its own `target_os`, so this is resolved at
 /// compile time, not runtime — a Windows build never contains the macOS
 /// hdiutil code and vice versa.
-fn install_release(archive_path: &Path, install_dir: &Path) -> Result<PathBuf, String> {
+fn install_release(
+    archive_path: &Path,
+    install_dir: &Path,
+    tx: &Sender<WorkerEvent>,
+) -> Result<PathBuf, String> {
+    let send_stage = |stage: &str| {
+        let _ = tx.send(WorkerEvent::State(AppState::Installing {
+            stage: stage.to_string(),
+        }));
+    };
+
     #[cfg(target_os = "macos")]
     {
-        install_from_dmg(archive_path, install_dir)
+        install_from_dmg(archive_path, install_dir, send_stage)
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = send_stage;
         install_from_targz(archive_path, install_dir)
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = send_stage;
         install_from_exe(archive_path, install_dir)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let _ = (archive_path, install_dir);
+        let _ = (archive_path, install_dir, send_stage);
         Err("automatic installation is not implemented for this platform".to_string())
     }
 }
 
 #[cfg(target_os = "macos")]
-fn install_from_dmg(dmg_path: &Path, install_dir: &Path) -> Result<PathBuf, String> {
+fn install_from_dmg(
+    dmg_path: &Path,
+    install_dir: &Path,
+    send_stage: impl Fn(&str),
+) -> Result<PathBuf, String> {
     use std::process::Command;
 
+    send_stage("Attaching disk image...");
     let attach_output = Command::new("hdiutil")
         .args(["attach", "-nobrowse", "-quiet"])
         .arg(dmg_path)
@@ -972,9 +1463,6 @@ fn install_from_dmg(dmg_path: &Path, install_dir: &Path) -> Result<PathBuf, Stri
         ));
     }
     let stdout = String::from_utf8_lossy(&attach_output.stdout);
-    // hdiutil's plain-text output can include extra informational lines
-    // before the mount-point line, so scan every line for one that actually
-    // looks like a /Volumes path instead of assuming it's the last line.
     let mount_point = stdout
         .lines()
         .filter_map(|line| line.split('\t').last())
@@ -984,6 +1472,7 @@ fn install_from_dmg(dmg_path: &Path, install_dir: &Path) -> Result<PathBuf, Stri
         .to_string();
     let mount_point = PathBuf::from(mount_point);
 
+    send_stage("Locating application bundle...");
     let app_source = std::fs::read_dir(&mount_point)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
@@ -1000,6 +1489,7 @@ fn install_from_dmg(dmg_path: &Path, install_dir: &Path) -> Result<PathBuf, Stri
         .ok_or("app bundle had no file name")?;
     let dest = install_dir.join(app_name);
 
+    send_stage("Copying application to install location...");
     if dest.exists() {
         std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
     }
@@ -1014,6 +1504,7 @@ fn install_from_dmg(dmg_path: &Path, install_dir: &Path) -> Result<PathBuf, Stri
         return Err("copying the app bundle failed".to_string());
     }
 
+    send_stage("Unmounting disk image...");
     let _ = Command::new("hdiutil")
         .args(["detach", "-quiet"])
         .arg(&mount_point)
@@ -1115,6 +1606,29 @@ fn find_file(root: &Path, target: &str) -> Option<PathBuf> {
     for dir in subdirs {
         if let Some(found) = find_file(&dir, target) {
             return Some(found);
+        }
+    }
+    None
+}
+
+/// Checks common install locations for an existing Tor Browser installation.
+fn find_existing_install() -> Option<PathBuf> {
+    let base = default_install_path();
+    if cfg!(target_os = "macos") {
+        let app = base.join("Tor Browser.app");
+        if app.exists() {
+            return Some(app);
+        }
+    } else if cfg!(target_os = "linux") {
+        let launcher = find_file(&base, "start-tor-browser");
+        if let Some(path) = launcher {
+            return Some(path);
+        }
+    } else if cfg!(target_os = "windows") {
+        let exe = find_file(&base, "firefox.exe")
+            .or_else(|| find_file(&base, "Tor Browser.exe"));
+        if let Some(path) = exe {
+            return Some(path);
         }
     }
     None
