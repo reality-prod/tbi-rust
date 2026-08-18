@@ -228,33 +228,33 @@ mod icons {
     pub const LOCK_SVG: &str = include_str!("assets/icons/lock.svg");
 
     pub fn download(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = DOWNLOAD_SVG.replace("currentColor", color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://download.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+        let svg = DOWNLOAD_SVG.replace("currentColor", &color.to_hex());
+        ui.add(egui::Image::from_bytes("bytes://download.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn check(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = CHECK_SVG.replace("currentColor", color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://check.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+        let svg = CHECK_SVG.replace("currentColor", &color.to_hex());
+        ui.add(egui::Image::from_bytes("bytes://check.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn cross(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = CROSS_SVG.replace("currentColor", color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://cross.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+        let svg = CROSS_SVG.replace("currentColor", &color.to_hex());
+        ui.add(egui::Image::from_bytes("bytes://cross.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn folder(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = FOLDER_SVG.replace("currentColor", color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://folder.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+        let svg = FOLDER_SVG.replace("currentColor", &color.to_hex());
+        ui.add(egui::Image::from_bytes("bytes://folder.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn launch(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = LAUNCH_SVG.replace("currentColor", color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://launch.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+        let svg = LAUNCH_SVG.replace("currentColor", &color.to_hex());
+        ui.add(egui::Image::from_bytes("bytes://launch.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn lock(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = LOCK_SVG.replace("currentColor", color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://lock.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+        let svg = LOCK_SVG.replace("currentColor", &color.to_hex());
+        ui.add(egui::Image::from_bytes("bytes://lock.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 }
 
@@ -1224,7 +1224,7 @@ impl TorBrowserBuilder {
         let text_secondary = self.text_secondary();
         ui.horizontal(|ui| {
             ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            let (_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
             let _ = icons::lock(ui, 14.0, text_secondary);
             ui.label(
                 RichText::new("Browse Privately. Explore Freely.")
