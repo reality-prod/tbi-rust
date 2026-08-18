@@ -41,6 +41,12 @@ use sequoia_openpgp as openpgp;
 use openpgp::parse::{Parse, stream::*};
 use openpgp::policy::StandardPolicy;
 
+/// This app's own version, shown in the About screen and sent as part of
+/// the HTTP User-Agent when talking to the Tor Project's release API.
+const APP_VERSION: &str = "0.2";
+/// Credited in the About screen.
+const APP_AUTHOR: &str = "Ribhav Revalli";
+
 // ---------------------------------------------------------------------
 // Platform detection
 // ---------------------------------------------------------------------
@@ -65,12 +71,20 @@ fn platform_label() -> &'static str {
 }
 
 /// Default install location, matching each OS's own conventions.
+///
+/// On macOS this is the system-wide `/Applications` folder — the same place
+/// Finder puts an app when you drag it out of a mounted `.dmg` — rather
+/// than a user-specific subfolder. Writing there may require administrator
+/// privileges depending on the account; `install_from_dmg` handles that by
+/// falling back to an authenticated install (see `install_app_bundle_privileged`)
+/// only if a plain copy is actually refused.
 fn default_install_path() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return PathBuf::from("/Applications");
+    }
     if let Some(user_dirs) = UserDirs::new() {
         let home = user_dirs.home_dir();
-        if cfg!(target_os = "macos") {
-            home.join("Applications").join("Tor Browser")
-        } else if cfg!(target_os = "windows") {
+        if cfg!(target_os = "windows") {
             // Best-effort: fall back to the home dir if LOCALAPPDATA isn't set.
             std::env::var("LOCALAPPDATA")
                 .map(PathBuf::from)
@@ -149,6 +163,53 @@ mod palette_dark {
 enum Theme {
     Light,
     Dark,
+}
+
+/// Whether the install targets just the current account or the whole
+/// machine. A "global" install writes into a system-owned location
+/// (`/Applications` on macOS, `/opt` on Linux) that regular users can't
+/// write to, so it needs an administrator/root password up front rather
+/// than discovering the permission failure partway through the copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallScope {
+    /// Installs into a location the current user already owns. No
+    /// elevated privileges are needed.
+    User,
+    /// Installs system-wide so every account on the machine can use it.
+    /// On macOS and Linux this is done with `sudo -s`, authenticated with
+    /// the password the person enters in the UI.
+    Global,
+}
+
+impl InstallScope {
+    /// The conventional install directory for this scope, matching each
+    /// OS's own layout for a per-user vs. system-wide install.
+    fn default_path(self) -> PathBuf {
+        match self {
+            InstallScope::User => default_install_path(),
+            InstallScope::Global => {
+                if cfg!(target_os = "macos") {
+                    // /Applications is already system-owned; User scope on
+                    // macOS points here too. Global just means the sudo
+                    // password is collected up front instead of only after
+                    // a plain copy fails.
+                    PathBuf::from("/Applications")
+                } else if cfg!(target_os = "linux") {
+                    PathBuf::from("/opt/tor-browser")
+                } else {
+                    default_install_path()
+                }
+            }
+        }
+    }
+
+    /// Whether this scope needs a sudo password on this platform. Only
+    /// macOS and Linux support the sudo-based privileged install; Windows
+    /// uses its own installer-driven elevation (UAC), so Global isn't
+    /// offered there.
+    fn needs_password(self) -> bool {
+        self == InstallScope::Global && (cfg!(target_os = "macos") || cfg!(target_os = "linux"))
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -281,6 +342,17 @@ enum AppState {
 /// Messages sent from the background worker thread back to the UI thread.
 enum WorkerEvent {
     State(AppState),
+    /// A shell/system command the worker is about to run (or its result),
+    /// shown to the person in the "View commands" panel. Passwords are
+    /// never included in these lines.
+    Log(String),
+}
+
+/// Sends a line to the "View commands" panel. Centralized so every call
+/// site formats log lines the same way and so passwords can never leak
+/// into it by accident — callers pass already-redacted text.
+fn log_line(tx: &Sender<WorkerEvent>, line: impl Into<String>) {
+    let _ = tx.send(WorkerEvent::Log(line.into()));
 }
 
 struct ReleaseInfo {
@@ -298,6 +370,21 @@ struct TorBrowserBuilder {
     confirm_tx: Option<Sender<bool>>,
     logo_bytes: &'static [u8],
     theme: Theme,
+    /// Whether this run installs for the current user only or system-wide.
+    install_scope: InstallScope,
+    /// The sudo/administrator password for a Global install. Kept only in
+    /// memory, sent once to the worker thread when the install starts, and
+    /// never logged.
+    sudo_password: String,
+    /// Whether the password field shows plain text or dots.
+    reveal_password: bool,
+    /// Every command the worker has run so far this session, newest last —
+    /// shown in the "View commands" panel.
+    command_log: Vec<String>,
+    /// Whether the "View commands" panel is expanded.
+    show_command_log: bool,
+    /// Whether the About overlay is open.
+    show_about: bool,
 }
 
 impl TorBrowserBuilder {
@@ -330,6 +417,12 @@ impl TorBrowserBuilder {
             confirm_tx: None,
             logo_bytes: include_bytes!("assets/tor_logo_tbb.svg"),
             theme: Theme::Light,
+            install_scope: InstallScope::User,
+            sudo_password: String::new(),
+            reveal_password: false,
+            command_log: Vec::new(),
+            show_command_log: false,
+            show_about: false,
         }
     }
 
@@ -343,10 +436,13 @@ impl TorBrowserBuilder {
         self.rx = Some(rx);
         self.confirm_tx = Some(confirm_tx);
         self.state = AppState::Checking;
+        self.command_log.clear();
 
         let install_dir = self.installation_path.clone();
+        let scope = self.install_scope;
+        let password = self.sudo_password.clone();
         std::thread::spawn(move || {
-            run_install_pipeline(install_dir, tx, confirm_rx);
+            run_install_pipeline(install_dir, scope, password, tx, confirm_rx);
         });
     }
 
@@ -367,6 +463,9 @@ impl TorBrowserBuilder {
                             done = true;
                         }
                         self.state = s;
+                    }
+                    WorkerEvent::Log(line) => {
+                        self.command_log.push(line);
                     }
                 }
             }
@@ -393,6 +492,7 @@ impl TorBrowserBuilder {
             ui.add_space(20.0);
             self.draw_footer(ui);
         });
+        self.draw_about_overlay(ui.ctx());
     }
 
     fn draw_header(&mut self, ui: &mut egui::Ui) {
@@ -418,14 +518,26 @@ impl TorBrowserBuilder {
                         .color(palette::PURPLE),
                 );
             });
-            ui.add_space(ui.available_width().max(0.0));
+            ui.add_space((ui.available_width() - 120.0).max(0.0));
+            let about_btn = ui.add(
+                egui::Button::new(
+                    RichText::new("\u{24D8}").size(18.0).color(self.text_primary()),
+                )
+                .fill(self.surface())
+                .stroke(Stroke::new(1.0_f32, self.border()))
+                .corner_radius(egui::CornerRadius::same(8)),
+            );
+            if about_btn.clicked() {
+                self.show_about = true;
+            }
+            ui.add_space(8.0);
             let label = if self.theme == Theme::Light { "\u{263E}" } else { "\u{2600}" };
             let theme_btn = ui.add(
                 egui::Button::new(
                     RichText::new(label).size(18.0).color(self.text_primary()),
                 )
                 .fill(self.surface())
-                .stroke(Stroke::new(1.0, self.border()))
+                .stroke(Stroke::new(1.0_f32, self.border()))
                 .corner_radius(egui::CornerRadius::same(8)),
             );
             if theme_btn.clicked() {
@@ -471,7 +583,65 @@ impl TorBrowserBuilder {
                     AppState::Complete { app_path } => self.draw_complete(ui, &app_path),
                     AppState::Error(e) => self.draw_error(ui, &e),
                 }
+                self.draw_command_log(ui);
             });
+    }
+
+    /// A collapsible "View commands" panel showing every system command the
+    /// worker thread has run so far (or is about to run), in order. Hidden
+    /// entirely until there's at least one command to show, so it doesn't
+    /// clutter the idle screen before an install has started.
+    fn draw_command_log(&mut self, ui: &mut egui::Ui) {
+        if self.command_log.is_empty() {
+            return;
+        }
+        let text_secondary = self.text_secondary();
+        let bg = self.bg();
+        let border = self.border();
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        let arrow = if self.show_command_log { "\u{25BE}" } else { "\u{25B8}" };
+        let toggle = ui.add(
+            egui::Button::new(
+                RichText::new(format!(
+                    "{arrow} View commands ({} run)",
+                    self.command_log.len()
+                ))
+                .size(12.5)
+                .color(text_secondary),
+            )
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE),
+        );
+        if toggle.clicked() {
+            self.show_command_log = !self.show_command_log;
+        }
+
+        if self.show_command_log {
+            ui.add_space(6.0);
+            egui::Frame::NONE
+                .fill(bg)
+                .stroke(Stroke::new(1.0_f32, border))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in &self.command_log {
+                                ui.label(
+                                    RichText::new(line.as_str())
+                                        .size(11.5)
+                                        .monospace()
+                                        .color(text_secondary),
+                                );
+                            }
+                        });
+                });
+        }
     }
 
     fn text_primary(&self) -> Color32 {
@@ -585,6 +755,9 @@ impl TorBrowserBuilder {
                     }
                 });
 
+            ui.add_space(18.0);
+            self.draw_scope_selector(ui);
+
             ui.add_space(22.0);
             let btn = ui.add_sized(
                 [ui.available_width(), 46.0],
@@ -617,6 +790,89 @@ impl TorBrowserBuilder {
                 );
             });
         });
+    }
+
+    /// Lets the person choose between a per-user install (default, no
+    /// privileges needed) and a system-wide install for every account on
+    /// the machine. The latter needs `sudo`, so a password field appears
+    /// once it's selected. Only offered on macOS and Linux — Windows uses
+    /// its own installer-driven elevation instead.
+    fn draw_scope_selector(&mut self, ui: &mut egui::Ui) {
+        if !(cfg!(target_os = "macos") || cfg!(target_os = "linux")) {
+            return;
+        }
+        let text_secondary = self.text_secondary();
+        let text_primary = self.text_primary();
+        let bg = self.bg();
+        let border_color = self.border();
+
+        ui.label(RichText::new("INSTALL FOR").size(11.0).color(text_secondary));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let user_selected = self.install_scope == InstallScope::User;
+            if ui.selectable_label(user_selected, "Just me").clicked() && !user_selected {
+                self.install_scope = InstallScope::User;
+                self.installation_path = InstallScope::User.default_path();
+                self.install_path_text = self.installation_path.display().to_string();
+            }
+            let global_selected = self.install_scope == InstallScope::Global;
+            if ui
+                .selectable_label(global_selected, "All users (sudo)")
+                .clicked()
+                && !global_selected
+            {
+                self.install_scope = InstallScope::Global;
+                self.installation_path = InstallScope::Global.default_path();
+                self.install_path_text = self.installation_path.display().to_string();
+            }
+        });
+
+        if self.install_scope.needs_password() {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("ADMINISTRATOR PASSWORD")
+                    .size(11.0)
+                    .color(text_secondary),
+            );
+            ui.add_space(4.0);
+            egui::Frame::NONE
+                .fill(bg)
+                .stroke(Stroke::new(1.0_f32, border_color))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sudo_password)
+                                .password(!self.reveal_password)
+                                .frame(false)
+                                .desired_width(ui.available_width() - 44.0)
+                                .text_color(text_primary)
+                                .hint_text("Your account password"),
+                        );
+                        let label = if self.reveal_password { "Hide" } else { "Show" };
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(label).size(11.5).color(text_secondary))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE),
+                            )
+                            .clicked()
+                        {
+                            self.reveal_password = !self.reveal_password;
+                        }
+                    });
+                });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Used locally to run `sudo -s` for this install. Never stored or sent \
+                     anywhere.",
+                )
+                .size(11.0)
+                .color(text_secondary),
+            );
+        }
     }
 
     fn draw_checking(ui: &mut egui::Ui) {
@@ -673,7 +929,14 @@ impl TorBrowserBuilder {
                 launch_app(&app_path);
             }
 
-            ui.add_space(10.0);
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                self.draw_scope_selector(ui);
+            });
+            ui.add_space(14.0);
+
             let reinstall_btn = ui.add_sized(
                 [280.0, 46.0],
                 egui::Button::new("")
@@ -749,7 +1012,7 @@ impl TorBrowserBuilder {
                 ui.add_space(2.0);
                 egui::Frame::NONE
                     .fill(self.bg())
-                    .stroke(Stroke::new(1.0, self.border()))
+                    .stroke(Stroke::new(1.0_f32, self.border()))
                     .corner_radius(egui::CornerRadius::same(6))
                     .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
@@ -792,7 +1055,7 @@ impl TorBrowserBuilder {
                     RichText::new("Cancel").size(14.0).color(text_secondary),
                 )
                 .fill(Color32::TRANSPARENT)
-                .stroke(Stroke::new(1.0, self.border()))
+                .stroke(Stroke::new(1.0_f32, self.border()))
                 .corner_radius(egui::CornerRadius::same(8)),
             );
             if cancel_btn.clicked() {
@@ -1004,15 +1267,128 @@ impl TorBrowserBuilder {
     fn draw_footer(&mut self, ui: &mut egui::Ui) {
         let text_secondary = self.text_secondary();
         ui.horizontal(|ui| {
-            ui.add_space((ui.available_width() - 220.0).max(0.0) / 2.0);
+            ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
             icons::lock(ui.painter(), rect.center(), 14.0, text_secondary);
             ui.label(
-                RichText::new("Secure  ·  Private  ·  Free")
+                RichText::new("Browse Privately. Explore Freely.")
                     .size(12.5)
                     .color(text_secondary),
             );
         });
+    }
+
+    /// A centered modal with information about the app: what it is, who
+    /// built it, and a reminder that it's an unofficial, third-party
+    /// installer rather than anything from the Tor Project itself.
+    fn draw_about_overlay(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let text_primary = self.text_primary();
+        let text_secondary = self.text_secondary();
+        let surface = self.surface();
+        let border = self.border();
+
+        // Dim the rest of the app behind the modal.
+        egui::Area::new(egui::Id::new("about_scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha(140));
+                // Clicking the scrim closes the modal, same as Cancel.
+                if ui
+                    .allocate_rect(screen, egui::Sense::click())
+                    .clicked()
+                {
+                    self.show_about = false;
+                }
+            });
+
+        let mut open = true;
+        egui::Window::new("About")
+            .id(egui::Id::new("about_window"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .frame(
+                egui::Frame::NONE
+                    .fill(surface)
+                    .stroke(Stroke::new(1.0_f32, border))
+                    .corner_radius(egui::CornerRadius::same(16))
+                    .inner_margin(egui::Margin::same(24)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::from_bytes("bytes://tor_logo_tbb.svg", self.logo_bytes)
+                            .fit_to_exact_size(egui::vec2(56.0, 56.0)),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Tor Browser Installer")
+                            .size(19.0)
+                            .strong()
+                            .color(text_primary),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(format!("Version {APP_VERSION}"))
+                            .size(12.5)
+                            .color(text_secondary),
+                    );
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new(
+                            "Downloads, verifies, and installs Tor Browser straight from the \
+                             Tor Project — nothing else bundled, nothing else phoning home.",
+                        )
+                        .size(13.5)
+                        .color(text_primary),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(
+                            "This is an unofficial, third-party tool and isn't affiliated with \
+                             or endorsed by The Tor Project.",
+                        )
+                        .size(12.0)
+                        .color(text_secondary),
+                    );
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(format!("Made by {APP_AUTHOR}"))
+                            .size(13.0)
+                            .color(text_primary),
+                    );
+                    ui.add_space(16.0);
+
+                    let close_btn = ui.add_sized(
+                        [140.0, 38.0],
+                        egui::Button::new(
+                            RichText::new("Close").size(13.5).color(Color32::WHITE),
+                        )
+                        .fill(palette::PURPLE)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(egui::CornerRadius::same(8)),
+                    );
+                    if close_btn.clicked() {
+                        self.show_about = false;
+                    }
+                });
+            });
+
+        if !open {
+            self.show_about = false;
+        }
     }
 
     // -------------------------------------------------------------
@@ -1066,12 +1442,29 @@ impl eframe::App for TorBrowserBuilder {
 
 fn run_install_pipeline(
     install_dir: PathBuf,
+    scope: InstallScope,
+    password: String,
     tx: Sender<WorkerEvent>,
     confirm_rx: Receiver<bool>,
 ) {
     let send_state = |s: AppState| {
         let _ = tx.send(WorkerEvent::State(s));
     };
+
+    if scope.needs_password() {
+        log_line(
+            &tx,
+            format!(
+                "Install scope: all users ({} — sudo)",
+                install_dir.display()
+            ),
+        );
+    } else {
+        log_line(
+            &tx,
+            format!("Install scope: current user ({})", install_dir.display()),
+        );
+    }
 
     let release = match fetch_release_info() {
         Ok(r) => r,
@@ -1161,7 +1554,7 @@ fn run_install_pipeline(
         stage: "Preparing installation...".to_string(),
     });
 
-    match install_release(&archive_path, &install_dir, &tx) {
+    match install_release(&archive_path, &install_dir, scope, &password, &tx) {
         Ok(app_path) => send_state(AppState::Complete { app_path }),
         Err(e) => send_state(AppState::Error(format!("Install failed: {e}"))),
     }
@@ -1188,7 +1581,7 @@ fn fetch_release_info() -> Result<ReleaseInfo, String> {
     );
 
     let body: serde_json::Value = reqwest::blocking::Client::builder()
-        .user_agent("tor-browser-builder/0.2")
+        .user_agent(format!("tor-browser-builder/{APP_VERSION}"))
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?
@@ -1273,7 +1666,7 @@ fn download_with_progress(
     tx: &Sender<WorkerEvent>,
 ) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
-        .user_agent("tor-browser-builder/0.2")
+        .user_agent(format!("tor-browser-builder/{APP_VERSION}"))
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())?;
@@ -1333,7 +1726,7 @@ fn sha256_of_file(path: &Path) -> Result<String, String> {
 /// .asc detached signature against the downloaded archive.
 fn verify_pgp_signature(file_path: &Path, sig_url: &str) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
-        .user_agent("tor-browser-builder/0.2")
+        .user_agent(format!("tor-browser-builder/{APP_VERSION}"))
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
@@ -1413,6 +1806,8 @@ fn verify_pgp_signature(file_path: &Path, sig_url: &str) -> Result<(), String> {
 fn install_release(
     archive_path: &Path,
     install_dir: &Path,
+    scope: InstallScope,
+    password: &str,
     tx: &Sender<WorkerEvent>,
 ) -> Result<PathBuf, String> {
     let send_stage = |stage: &str| {
@@ -1423,94 +1818,655 @@ fn install_release(
 
     #[cfg(target_os = "macos")]
     {
-        install_from_dmg(archive_path, install_dir, send_stage)
+        install_from_dmg(archive_path, install_dir, scope, password, send_stage, tx)
     }
     #[cfg(target_os = "linux")]
     {
         let _ = send_stage;
-        install_from_targz(archive_path, install_dir)
+        install_from_targz(archive_path, install_dir, scope, password, tx)
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = send_stage;
+        let _ = (send_stage, scope, password);
         install_from_exe(archive_path, install_dir)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let _ = (archive_path, install_dir, send_stage);
+        let _ = (archive_path, install_dir, scope, password, send_stage, tx);
         Err("automatic installation is not implemented for this platform".to_string())
     }
 }
 
+/// Runs `shell_cmd` with `sudo -s`, feeding `password` on `sudo`'s stdin so
+/// the person only has to type it once in the UI rather than at an
+/// interactive terminal prompt. Used for the "install for all users" path
+/// on macOS and Linux.
+///
+/// The command itself (never the password) is sent to the "View commands"
+/// panel both before it runs and, on failure, with the captured stderr, so
+/// the person can see exactly what was attempted.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_privileged_shell(
+    shell_cmd: &str,
+    password: &str,
+    tx: &Sender<WorkerEvent>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    log_line(tx, format!("$ sudo -s -- sh -c \"{shell_cmd}\""));
+
+    let mut child = Command::new("sudo")
+        .args(["-S", "-p", "", "-k", "-s", "--"])
+        .arg("sh")
+        .arg("-c")
+        .arg(shell_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to launch sudo: {e}"))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        // sudo -S reads the password up to the first newline from stdin,
+        // then hands the rest of stdin (nothing, here) to the command.
+        let _ = writeln!(stdin, "{password}");
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("sudo did not complete: {e}"))?;
+
+    if output.status.success() {
+        log_line(tx, "  -> ok");
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    log_line(tx, format!("  -> failed: {}", stderr.trim()));
+    let lower = stderr.to_lowercase();
+    if lower.contains("incorrect password") || lower.contains("sorry, try again") {
+        return Err("the administrator password was incorrect".to_string());
+    }
+    if lower.contains("a password is required") || lower.contains("no tty present") {
+        return Err(
+            "sudo could not prompt for a password in this environment — this usually means \
+             the account isn't allowed to use sudo, or a password wasn't entered"
+                .to_string(),
+        );
+    }
+    Err(format!("privileged command failed: {}", stderr.trim()))
+}
+
+/// Attaches `dmg_path` with `hdiutil` and returns the `/Volumes/...` mount
+/// point it was mounted at.
+///
+/// This used to parse `hdiutil attach`'s plain-text table output by
+/// splitting on tabs and taking the last column. That format isn't stable:
+/// the column layout has shifted across macOS versions and the mount-point
+/// column isn't always tab-delimited the way earlier releases were, so the
+/// old code could fail to find a `/Volumes/...` line even though the attach
+/// itself succeeded — producing exactly the "could not determine mount
+/// point from hdiutil output" error this was fixed for.
+///
+/// Instead we ask hdiutil for `-plist` output and pull the value out of the
+/// `mount-point` key structurally, which is the form Apple documents as
+/// stable. The old tab-delimited scan is kept as a fallback in case the
+/// plist ever can't be parsed. We also retry the attach itself a few times:
+/// `hdiutil attach` can fail transiently (e.g. Disk Arbitration still
+/// settling right after a previous image was detached), and on macOS this
+/// was previously a hard failure with no retry at all.
+///
+/// Deliberately NOT passing `-quiet` alongside `-plist`: on at least some
+/// macOS/hdiutil versions the combination silently suppresses the plist
+/// output entirely even though the attach itself succeeds — confirmed by
+/// the fact that a "failed" attach here can still leave a new
+/// `/Volumes/Tor Browser N` behind. `-plist` is already the
+/// machine-readable, non-chatty mode; `-quiet` has nothing useful left to
+/// suppress and was actively breaking output parsing.
+#[cfg(target_os = "macos")]
+fn attach_dmg_with_retry(
+    dmg_path: &Path,
+    send_stage: &impl Fn(&str),
+) -> Result<PathBuf, String> {
+    use std::process::Command;
+
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+
+    // Clean up any stale mounts left behind by earlier failed attempts
+    // (e.g. "Tor Browser 1", "Tor Browser 2", ...) so they don't pile up
+    // run after run and so a retry isn't confused by which volume is the
+    // one it just attached.
+    detach_stale_tor_browser_volumes();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            send_stage("Retrying disk image attach...");
+            std::thread::sleep(Duration::from_millis(750));
+        }
+
+        let volumes_before = list_volume_names();
+
+        let attach_output = match Command::new("hdiutil")
+            .args(["attach", "-plist", "-nobrowse"])
+            .arg(dmg_path)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                last_err = format!("failed to run hdiutil attach: {e}");
+                continue;
+            }
+        };
+
+        if !attach_output.status.success() {
+            last_err = format!(
+                "hdiutil attach failed: {}",
+                String::from_utf8_lossy(&attach_output.stderr).trim()
+            );
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&attach_output.stdout);
+
+        if let Some(mp) = mount_points_from_plist(&stdout)
+            .into_iter()
+            .find(|s| s.starts_with("/Volumes/"))
+        {
+            return Ok(PathBuf::from(mp));
+        }
+
+        // Defense in depth: fall back to the old heuristic in case the
+        // plist for some reason couldn't be parsed (e.g. a future hdiutil
+        // change to the plist schema itself).
+        if let Some(mp) = stdout
+            .lines()
+            .filter_map(|line| line.split('\t').last())
+            .map(str::trim)
+            .find(|s| s.starts_with("/Volumes/"))
+        {
+            return Ok(PathBuf::from(mp));
+        }
+
+        // Last resort: we've now confirmed on real hardware that hdiutil
+        // can report success (exit 0) with completely empty stdout while
+        // still actually mounting the volume. If both parses above came
+        // up empty despite a successful exit status, diff /Volumes
+        // before/after the attach to find whatever just appeared.
+        let volumes_after = list_volume_names();
+        if let Some(new_volume) = volumes_after.iter().find(|v| !volumes_before.contains(v)) {
+            return Ok(PathBuf::from("/Volumes").join(new_volume));
+        }
+
+        last_err = "could not determine mount point from hdiutil output".to_string();
+    }
+
+    Err(format!("{last_err} (after {MAX_ATTEMPTS} attempts)"))
+}
+
+/// Names of every entry currently under `/Volumes` (best-effort — an
+/// unreadable `/Volumes` just yields an empty list rather than an error,
+/// since this is only ever used as a diffing aid, not a source of truth).
+#[cfg(target_os = "macos")]
+fn list_volume_names() -> Vec<String> {
+    std::fs::read_dir("/Volumes")
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Detaches any `/Volumes/Tor Browser` / `Tor Browser 1` / `Tor Browser 2`
+/// / ... volumes left mounted from previous attach attempts that errored
+/// out before reaching their own `hdiutil detach` call. Run once before a
+/// fresh attach so repeated failed installs don't pile up duplicate mounts
+/// (macOS auto-suffixes a number onto the volume name to avoid a
+/// collision, which is where the " 1", " 2", ... come from).
+#[cfg(target_os = "macos")]
+fn detach_stale_tor_browser_volumes() {
+    use std::process::Command;
+
+    let Ok(entries) = std::fs::read_dir("/Volumes") else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_tor_browser_volume = name == "Tor Browser"
+            || name
+                .strip_prefix("Tor Browser ")
+                .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()));
+        if is_tor_browser_volume {
+            let _ = Command::new("hdiutil")
+                .args(["detach", "-quiet"])
+                .arg(entry.path())
+                .status();
+        }
+    }
+}
+
+/// Extracts every `mount-point` string value from an `hdiutil attach
+/// -plist` XML property list, without pulling in a full plist-parsing
+/// dependency. `hdiutil`'s plist is a flat, predictable
+/// `<key>...</key><string>...</string>` structure for the fields we care
+/// about, so a small manual scan is enough and avoids depending on the
+/// exact tab/column layout of the text output.
+#[cfg(target_os = "macos")]
+fn mount_points_from_plist(xml: &str) -> Vec<String> {
+    const KEY: &str = "<key>mount-point</key>";
+    let mut mount_points = Vec::new();
+    let mut rest = xml;
+
+    while let Some(key_idx) = rest.find(KEY) {
+        let after_key = &rest[key_idx + KEY.len()..];
+        if let Some(str_start) = after_key.find("<string>") {
+            let value_start = str_start + "<string>".len();
+            if let Some(value_len) = after_key[value_start..].find("</string>") {
+                let raw = &after_key[value_start..value_start + value_len];
+                mount_points.push(unescape_xml(raw));
+            }
+        }
+        // Continue scanning past this <key>mount-point</key> occurrence so
+        // we find every entry in system-entities, not just the first.
+        rest = after_key;
+    }
+
+    mount_points
+}
+
+/// Unescapes the handful of XML entities hdiutil's plist output can contain
+/// in a mount-point path (e.g. `&amp;` in "Tor Browser &amp; Friends").
+#[cfg(target_os = "macos")]
+fn unescape_xml(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+#[cfg(target_os = "macos")]
+enum CopyOutcome {
+    Ok,
+    PermissionDenied,
+    Failed(String),
+}
+
+/// Copies `app_source` into `install_dir` as a plain (non-privileged)
+/// operation, removing any existing bundle of the same name first — i.e.
+/// exactly what Finder does when you drag an app out of a mounted disk
+/// image onto a folder you already own. Distinguishes a permissions
+/// failure from every other failure so the caller can decide whether an
+/// authenticated retry makes sense.
+#[cfg(target_os = "macos")]
+fn copy_app_bundle_plain(
+    app_source: &Path,
+    install_dir: &Path,
+    dest: &Path,
+    tx: &Sender<WorkerEvent>,
+) -> CopyOutcome {
+    use std::io::ErrorKind;
+    use std::process::Command;
+
+    if let Err(e) = std::fs::create_dir_all(install_dir) {
+        return if e.kind() == ErrorKind::PermissionDenied {
+            CopyOutcome::PermissionDenied
+        } else {
+            CopyOutcome::Failed(e.to_string())
+        };
+    }
+
+    if dest.exists() {
+        if let Err(e) = std::fs::remove_dir_all(dest) {
+            return if e.kind() == ErrorKind::PermissionDenied {
+                CopyOutcome::PermissionDenied
+            } else {
+                CopyOutcome::Failed(e.to_string())
+            };
+        }
+    }
+
+    log_line(
+        tx,
+        format!("$ cp -R {} {}", app_source.display(), install_dir.display()),
+    );
+    let copy_result = Command::new("cp").args(["-R"]).arg(app_source).arg(install_dir).output();
+    match copy_result {
+        Ok(output) if output.status.success() => CopyOutcome::Ok,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("Permission denied") || stderr.contains("Operation not permitted") {
+                CopyOutcome::PermissionDenied
+            } else {
+                CopyOutcome::Failed(format!("copying the app bundle failed: {}", stderr.trim()))
+            }
+        }
+        Err(e) => CopyOutcome::Failed(format!("failed to run cp: {e}")),
+    }
+}
+
+/// Same install as `copy_app_bundle_plain`, but run inside a single
+/// administrator-authenticated shell command via `osascript`. This is what
+/// puts up the standard macOS password/Touch ID prompt, the same
+/// mechanism regular signed installers use to write into `/Applications`
+/// for a non-admin account, and it's also how an existing Tor Browser
+/// install owned by another user/root gets replaced.
+///
+/// Everything (removing the old bundle, ensuring the target directory
+/// exists, and copying the new bundle in) happens as one `do shell script
+/// ... with administrator privileges` call so the person only sees a
+/// single password prompt, not one per step.
+#[cfg(target_os = "macos")]
+fn install_app_bundle_privileged(
+    app_source: &Path,
+    install_dir: &Path,
+    dest: &Path,
+    tx: &Sender<WorkerEvent>,
+) -> Result<(), String> {
+    use std::process::Command;
+
+    let shell_cmd = format!(
+        "mkdir -p {install_dir} && rm -rf {dest} && cp -R {source} {install_dir}",
+        install_dir = shell_quote(install_dir),
+        dest = shell_quote(dest),
+        source = shell_quote(app_source),
+    );
+    log_line(
+        tx,
+        "Requesting administrator access via the macOS password/Touch ID prompt...",
+    );
+    let apple_script = format!(
+        "do shell script \"{}\" with administrator privileges with prompt \"Tor Browser Builder needs your password to install Tor Browser in {}.\"",
+        applescript_escape(&shell_cmd),
+        applescript_escape(&install_dir.display().to_string()),
+    );
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(apple_script)
+        .output()
+        .map_err(|e| format!("failed to launch the administrator authorization prompt: {e}"))?;
+
+    if output.status.success() {
+        log_line(tx, "  -> ok");
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // AppleScript reports a user-cancelled authorization dialog as error
+    // -128 ("User canceled."); surface that as a clear, expected outcome
+    // rather than a generic failure.
+    if stderr.contains("-128") || stderr.to_lowercase().contains("user canceled") {
+        log_line(tx, "  -> cancelled by user");
+        return Err("installation was cancelled at the administrator password prompt".to_string());
+    }
+    log_line(tx, format!("  -> failed: {}", stderr.trim()));
+    Err(format!("privileged install failed: {}", stderr.trim()))
+}
+
+/// Same install as `install_app_bundle_privileged`, but authenticated with
+/// `sudo -s` and the password typed into the "All users" field in the UI,
+/// instead of the native macOS Touch ID/password dialog. Used when the
+/// person has explicitly chosen a system-wide install and supplied a
+/// password up front, so installing doesn't have to wait for a plain copy
+/// to fail first.
+#[cfg(target_os = "macos")]
+fn install_app_bundle_privileged_sudo(
+    app_source: &Path,
+    install_dir: &Path,
+    dest: &Path,
+    password: &str,
+    tx: &Sender<WorkerEvent>,
+) -> Result<(), String> {
+    let shell_cmd = format!(
+        "mkdir -p {install_dir} && rm -rf {dest} && cp -R {source} {install_dir}",
+        install_dir = shell_quote(install_dir),
+        dest = shell_quote(dest),
+        source = shell_quote(app_source),
+    );
+    run_privileged_shell(&shell_cmd, password, tx)
+}
+
+/// Quotes a path for safe interpolation into a POSIX shell command string.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
+}
+
+/// Escapes a string for interpolation into a double-quoted AppleScript
+/// string literal (used to build the `do shell script "..."` command).
+#[cfg(target_os = "macos")]
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Installs Tor Browser from a `.dmg`.
+///
+/// The normal path mounts the image with `hdiutil` and copies the `.app`
+/// off it — that's the standard, dependency-free way to get files out of
+/// a disk image, and it's exactly what Finder does under the hood.
+///
+/// If `hdiutil attach` itself won't succeed at all (as opposed to just
+/// needing another attempt — `attach_dmg_with_retry` already retries),
+/// that usually means something is preventing Disk Arbitration from doing
+/// its job in this environment — a corporate MDM restriction, a headless
+/// session, or similar. In that case we don't just give up: `.dmg`'s
+/// on-disk format (a UDIF wrapper around an HFS+/APFS volume) can be read
+/// directly by 7-Zip without going through the mount machinery at all, so
+/// we fall back to extracting it that way via `install_via_7z_extraction`.
+/// That path requires `7zz`/`7z`/`7za` to be installed (e.g. `brew install
+/// sevenzip`), which is why it's the fallback and not the default — it's
+/// an extra dependency most people won't have — but it means a broken
+/// `hdiutil` no longer has to be a dead end.
 #[cfg(target_os = "macos")]
 fn install_from_dmg(
     dmg_path: &Path,
     install_dir: &Path,
+    scope: InstallScope,
+    password: &str,
     send_stage: impl Fn(&str),
+    tx: &Sender<WorkerEvent>,
+) -> Result<PathBuf, String> {
+    send_stage("Attaching disk image...");
+    match attach_dmg_with_retry(dmg_path, &send_stage) {
+        Ok(mount_point) => {
+            install_from_mounted_dmg(&mount_point, install_dir, scope, password, &send_stage, tx)
+        }
+        Err(attach_err) => {
+            send_stage("Disk image would not attach — extracting without mounting...");
+            install_via_7z_extraction(dmg_path, install_dir, scope, password, &send_stage, tx)
+                .map_err(|extract_err| {
+                    format!(
+                        "hdiutil attach failed ({attach_err}), and the mount-free fallback also \
+                         failed ({extract_err})"
+                    )
+                })
+        }
+    }
+}
+
+/// The normal, mount-based install path: copy the `.app` out of an
+/// already-attached disk image at `mount_point`.
+#[cfg(target_os = "macos")]
+fn install_from_mounted_dmg(
+    mount_point: &Path,
+    install_dir: &Path,
+    scope: InstallScope,
+    password: &str,
+    send_stage: &impl Fn(&str),
+    tx: &Sender<WorkerEvent>,
 ) -> Result<PathBuf, String> {
     use std::process::Command;
 
-    send_stage("Attaching disk image...");
-    let attach_output = Command::new("hdiutil")
-        .args(["attach", "-nobrowse", "-quiet"])
-        .arg(dmg_path)
-        .output()
-        .map_err(|e| format!("failed to run hdiutil attach: {e}"))?;
-    if !attach_output.status.success() {
-        return Err(format!(
-            "hdiutil attach failed: {}",
-            String::from_utf8_lossy(&attach_output.stderr)
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&attach_output.stdout);
-    let mount_point = stdout
-        .lines()
-        .filter_map(|line| line.split('\t').last())
-        .map(str::trim)
-        .find(|s| s.starts_with("/Volumes/"))
-        .ok_or("could not determine mount point from hdiutil output")?
-        .to_string();
-    let mount_point = PathBuf::from(mount_point);
+    let detach = || {
+        let _ = Command::new("hdiutil").args(["detach", "-quiet"]).arg(mount_point).status();
+    };
 
     send_stage("Locating application bundle...");
-    let app_source = std::fs::read_dir(&mount_point)
+    let app_source = std::fs::read_dir(mount_point)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.extension().map(|ext| ext == "app").unwrap_or(false))
         .ok_or_else(|| {
-            let _ = Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mount_point).status();
+            detach();
             "no .app bundle found inside the disk image".to_string()
         })?;
 
-    std::fs::create_dir_all(install_dir).map_err(|e| e.to_string())?;
     let app_name = app_source
         .file_name()
         .ok_or("app bundle had no file name")?;
     let dest = install_dir.join(app_name);
 
+    // This mirrors exactly what Finder does when you drag the .app out of
+    // the mounted disk image and drop it on a folder: no separate
+    // "extraction" step exists for a .dmg because it isn't an archive
+    // format, it's a disk image — the .app bundle inside it is copied as
+    // a regular directory once the image is mounted.
     send_stage("Copying application to install location...");
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
-    }
-    let copy_status = Command::new("cp")
-        .args(["-R"])
-        .arg(&app_source)
-        .arg(install_dir)
-        .status()
-        .map_err(|e| format!("failed to run cp: {e}"))?;
-    if !copy_status.success() {
-        let _ = Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mount_point).status();
-        return Err("copying the app bundle failed".to_string());
+    match install_app_bundle(&app_source, install_dir, &dest, scope, password, tx) {
+        Ok(()) => {}
+        Err(e) => {
+            detach();
+            return Err(e);
+        }
     }
 
     send_stage("Unmounting disk image...");
-    let _ = Command::new("hdiutil")
-        .args(["detach", "-quiet"])
-        .arg(&mount_point)
-        .status();
+    detach();
 
     Ok(dest)
+}
+
+/// Fallback install path used when `hdiutil attach` won't work at all:
+/// reads the `.dmg` directly with 7-Zip (which understands the UDIF/HFS+
+/// structure without needing Disk Arbitration to mount anything) and
+/// copies the `.app` bundle it finds inside out to `install_dir`.
+#[cfg(target_os = "macos")]
+fn install_via_7z_extraction(
+    dmg_path: &Path,
+    install_dir: &Path,
+    scope: InstallScope,
+    password: &str,
+    send_stage: &impl Fn(&str),
+    tx: &Sender<WorkerEvent>,
+) -> Result<PathBuf, String> {
+    use std::process::Command;
+
+    let seven_zip_bin = find_seven_zip_binary().ok_or_else(|| {
+        "no 7-Zip binary (7zz/7z/7za) is installed to extract the disk image without mounting \
+         it — install one with `brew install sevenzip` (or `brew install p7zip`) and try again"
+            .to_string()
+    })?;
+
+    let extract_dir = std::env::temp_dir()
+        .join("tor-browser-builder")
+        .join("dmg-extract");
+    // Clean up any stale extraction left over from a previous attempt.
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    std::fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
+
+    send_stage("Extracting disk image contents (7-Zip)...");
+    let extract_status = Command::new(seven_zip_bin)
+        .arg("x")
+        .arg(dmg_path)
+        .arg(format!("-o{}", extract_dir.display()))
+        .arg("-y")
+        .status()
+        .map_err(|e| format!("failed to run {seven_zip_bin}: {e}"))?;
+    if !extract_status.success() {
+        return Err(format!("{seven_zip_bin} could not extract the disk image"));
+    }
+
+    // A DMG's internal partition structure sometimes means the .app ends
+    // up nested a level or two down (e.g. inside an extracted HFS/APFS
+    // partition image rather than at the top level), so search
+    // recursively rather than assuming it's directly in extract_dir.
+    send_stage("Locating application bundle...");
+    let app_source =
+        find_app_bundle(&extract_dir).ok_or("no .app bundle found inside the extracted disk image")?;
+
+    let app_name = app_source.file_name().ok_or("app bundle had no file name")?;
+    let dest = install_dir.join(app_name);
+
+    send_stage("Copying application to install location...");
+    install_app_bundle(&app_source, install_dir, &dest, scope, password, tx)?;
+
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    Ok(dest)
+}
+
+/// Copies an app bundle into `install_dir`, choosing the right level of
+/// privilege for the requested `scope`:
+///
+/// - `InstallScope::Global` always authenticates up front with `sudo -s`
+///   using `password`, since a system-wide destination is expected to need
+///   it.
+/// - `InstallScope::User` tries a plain copy first (the common case — the
+///   person owns the destination) and only falls back to the native macOS
+///   administrator prompt if that copy is actually refused.
+#[cfg(target_os = "macos")]
+fn install_app_bundle(
+    app_source: &Path,
+    install_dir: &Path,
+    dest: &Path,
+    scope: InstallScope,
+    password: &str,
+    tx: &Sender<WorkerEvent>,
+) -> Result<(), String> {
+    if scope == InstallScope::Global {
+        return install_app_bundle_privileged_sudo(app_source, install_dir, dest, password, tx);
+    }
+
+    match copy_app_bundle_plain(app_source, install_dir, dest, tx) {
+        CopyOutcome::Ok => Ok(()),
+        CopyOutcome::PermissionDenied => {
+            install_app_bundle_privileged(app_source, install_dir, dest, tx)
+        }
+        CopyOutcome::Failed(e) => Err(e),
+    }
+}
+
+/// Looks for an installed 7-Zip command-line binary under any of its
+/// common names. `sevenzip` (Homebrew) installs `7zz`; `p7zip` installs
+/// `7z`/`7za`. We don't care which one is present, just that one is.
+#[cfg(target_os = "macos")]
+fn find_seven_zip_binary() -> Option<&'static str> {
+    for candidate in ["7zz", "7z", "7za"] {
+        if let Ok(output) = std::process::Command::new("which").arg(candidate).output() {
+            if output.status.success() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Recursively searches `root` for the first entry whose extension is
+/// `.app`, since an extracted disk image's `.app` bundle isn't guaranteed
+/// to be at the top level.
+#[cfg(target_os = "macos")]
+fn find_app_bundle(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().map(|ext| ext == "app").unwrap_or(false) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            subdirs.push(path);
+        }
+    }
+    for dir in subdirs {
+        if let Some(found) = find_app_bundle(&dir) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Linux releases ship as a `.tar.xz` containing a top-level `tor-browser/`
@@ -1518,20 +2474,50 @@ fn install_from_dmg(
 /// (rather than pulling in a `.xz` decoder crate) and locate the launcher
 /// script inside it.
 #[cfg(target_os = "linux")]
-fn install_from_targz(archive_path: &Path, install_dir: &Path) -> Result<PathBuf, String> {
+fn install_from_targz(
+    archive_path: &Path,
+    install_dir: &Path,
+    scope: InstallScope,
+    password: &str,
+    tx: &Sender<WorkerEvent>,
+) -> Result<PathBuf, String> {
     use std::process::Command;
 
-    std::fs::create_dir_all(install_dir).map_err(|e| e.to_string())?;
+    if scope == InstallScope::Global {
+        // /opt (and similar system locations) generally aren't writable by
+        // a regular account, so the whole extraction — creating the
+        // directory, un-tarring the archive, and making the launcher
+        // executable — runs as one `sudo -s` command rather than trying an
+        // unprivileged attempt first.
+        let shell_cmd = format!(
+            "mkdir -p {install_dir} && tar -xJf {archive} -C {install_dir} && \
+             find {install_dir} -name start-tor-browser -exec chmod +x {{}} + && \
+             chmod -R a+rX {install_dir}",
+            install_dir = shell_quote(install_dir),
+            archive = shell_quote(archive_path),
+        );
+        run_privileged_shell(&shell_cmd, password, tx)?;
+    } else {
+        std::fs::create_dir_all(install_dir).map_err(|e| e.to_string())?;
 
-    let status = Command::new("tar")
-        .arg("-xJf")
-        .arg(archive_path)
-        .arg("-C")
-        .arg(install_dir)
-        .status()
-        .map_err(|e| format!("failed to run tar (is it installed?): {e}"))?;
-    if !status.success() {
-        return Err("extracting the .tar.xz archive failed".to_string());
+        log_line(
+            tx,
+            format!(
+                "$ tar -xJf {} -C {}",
+                archive_path.display(),
+                install_dir.display()
+            ),
+        );
+        let status = Command::new("tar")
+            .arg("-xJf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(install_dir)
+            .status()
+            .map_err(|e| format!("failed to run tar (is it installed?): {e}"))?;
+        if !status.success() {
+            return Err("extracting the .tar.xz archive failed".to_string());
+        }
     }
 
     // Find the launcher script anywhere under the extracted tree instead of
@@ -1540,8 +2526,7 @@ fn install_from_targz(archive_path: &Path, install_dir: &Path) -> Result<PathBuf
     let launcher = find_file(install_dir, "start-tor-browser")
         .ok_or("could not find start-tor-browser inside the extracted archive")?;
 
-    #[cfg(unix)]
-    {
+    if scope != InstallScope::Global {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(&launcher) {
             let mut perms = meta.permissions();
@@ -1614,14 +2599,36 @@ fn find_file(root: &Path, target: &str) -> Option<PathBuf> {
 fn find_existing_install() -> Option<PathBuf> {
     let base = default_install_path();
     if cfg!(target_os = "macos") {
+        // Check the current system-wide default (/Applications) first...
         let app = base.join("Tor Browser.app");
         if app.exists() {
             return Some(app);
         }
+        // ...then fall back to where earlier versions of this app used to
+        // install (a per-user ~/Applications/Tor Browser/ subfolder), so an
+        // existing install isn't "lost" just because the default changed.
+        if let Some(user_dirs) = UserDirs::new() {
+            let legacy = user_dirs
+                .home_dir()
+                .join("Applications")
+                .join("Tor Browser")
+                .join("Tor Browser.app");
+            if legacy.exists() {
+                return Some(legacy);
+            }
+        }
     } else if cfg!(target_os = "linux") {
-        let launcher = find_file(&base, "start-tor-browser");
-        if let Some(path) = launcher {
+        if let Some(path) = find_file(&base, "start-tor-browser") {
             return Some(path);
+        }
+        // Also check the system-wide (Global scope) location, so a
+        // previous "all users" install is found even though the per-user
+        // location is the default search base.
+        let global_base = InstallScope::Global.default_path();
+        if global_base != base {
+            if let Some(path) = find_file(&global_base, "start-tor-browser") {
+                return Some(path);
+            }
         }
     } else if cfg!(target_os = "windows") {
         let exe = find_file(&base, "firefox.exe")
