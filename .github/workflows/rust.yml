@@ -16,6 +16,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install
+      run: apt install -y pkg-config nettle-dev
     - name: Build
       run: cargo build --verbose
     - name: Run tests
