@@ -43,7 +43,7 @@ use openpgp::policy::StandardPolicy;
 
 /// This app's own version, shown in the About screen and sent as part of
 /// the HTTP User-Agent when talking to the Tor Project's release API.
-const APP_VERSION: &str = "0.2";
+const APP_VERSION: &str = "0.2 BETA";
 /// Credited in the About screen.
 const APP_AUTHOR: &str = "Ribhav Revalli";
 
@@ -218,92 +218,45 @@ impl InstallScope {
 // ---------------------------------------------------------------------
 
 mod icons {
-    use egui::{Painter, Pos2, Stroke, Vec2};
+    use egui::Color32;
 
-    pub fn download(painter: &Painter, center: Pos2, size: f32, color: egui::Color32) {
-        let stroke = Stroke::new(size * 0.12, color);
-        let top = center + Vec2::new(0.0, -size * 0.5);
-        let bottom = center + Vec2::new(0.0, size * 0.15);
-        painter.line_segment([top, bottom], stroke);
-        let tip = bottom;
-        painter.line_segment([tip, tip + Vec2::new(-size * 0.28, -size * 0.28)], stroke);
-        painter.line_segment([tip, tip + Vec2::new(size * 0.28, -size * 0.28)], stroke);
-        let base_y = center.y + size * 0.5;
-        painter.line_segment(
-            [
-                Pos2::new(center.x - size * 0.42, base_y),
-                Pos2::new(center.x + size * 0.42, base_y),
-            ],
-            stroke,
-        );
+    pub const DOWNLOAD_SVG: &str = include_str!("assets/icons/download.svg");
+    pub const CHECK_SVG: &str = include_str!("assets/icons/check.svg");
+    pub const CROSS_SVG: &str = include_str!("assets/icons/cross.svg");
+    pub const FOLDER_SVG: &str = include_str!("assets/icons/folder.svg");
+    pub const LAUNCH_SVG: &str = include_str!("assets/icons/launch.svg");
+    pub const LOCK_SVG: &str = include_str!("assets/icons/lock.svg");
+
+    pub fn download(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+        let svg = DOWNLOAD_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        ui.add(egui::Image::from_bytes("bytes://download.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
-    pub fn check(painter: &Painter, center: Pos2, size: f32, color: egui::Color32) {
-        let stroke = Stroke::new(size * 0.14, color);
-        let a = center + Vec2::new(-size * 0.32, 0.02 * size);
-        let b = center + Vec2::new(-size * 0.06, size * 0.28);
-        let c = center + Vec2::new(size * 0.38, -size * 0.32);
-        painter.line_segment([a, b], stroke);
-        painter.line_segment([b, c], stroke);
+    pub fn check(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+        let svg = CHECK_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        ui.add(egui::Image::from_bytes("bytes://check.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
-    pub fn cross(painter: &Painter, center: Pos2, size: f32, color: egui::Color32) {
-        let stroke = Stroke::new(size * 0.13, color);
-        let r = size * 0.32;
-        painter.line_segment(
-            [center + Vec2::new(-r, -r), center + Vec2::new(r, r)],
-            stroke,
-        );
-        painter.line_segment(
-            [center + Vec2::new(-r, r), center + Vec2::new(r, -r)],
-            stroke,
-        );
+    pub fn cross(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+        let svg = CROSS_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        ui.add(egui::Image::from_bytes("bytes://cross.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
-    pub fn folder(painter: &Painter, center: Pos2, size: f32, color: egui::Color32) {
-        let w = size * 0.9;
-        let h = size * 0.62;
-        let top_left = center + Vec2::new(-w / 2.0, -h / 2.0 + size * 0.06);
-        let rect = egui::Rect::from_min_size(top_left, Vec2::new(w, h));
-        painter.rect_stroke(
-            rect,
-            egui::CornerRadius::same((size * 0.08) as u8),
-            Stroke::new(size * 0.09, color),
-            egui::StrokeKind::Inside,
-        );
-        let tab = egui::Rect::from_min_size(
-            top_left + Vec2::new(size * 0.06, -size * 0.14),
-            Vec2::new(w * 0.42, size * 0.16),
-        );
-        painter.rect_filled(tab, egui::CornerRadius::same((size * 0.06) as u8), color);
+    pub fn folder(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+        let svg = FOLDER_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        ui.add(egui::Image::from_bytes("bytes://folder.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
-    pub fn launch(painter: &Painter, center: Pos2, size: f32, color: egui::Color32) {
-        let stroke = Stroke::new(size * 0.12, color);
-        let start = center + Vec2::new(-size * 0.35, size * 0.35);
-        let end = center + Vec2::new(size * 0.35, -size * 0.35);
-        painter.line_segment([start, end], stroke);
-        painter.line_segment([end, end + Vec2::new(-size * 0.32, 0.0)], stroke);
-        painter.line_segment([end, end + Vec2::new(0.0, size * 0.32)], stroke);
+    pub fn launch(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+        let svg = LAUNCH_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        ui.add(egui::Image::from_bytes("bytes://launch.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
-    pub fn lock(painter: &Painter, center: Pos2, size: f32, color: egui::Color32) {
-        let body_w = size * 0.7;
-        let body_h = size * 0.5;
-        let body = egui::Rect::from_center_size(
-            center + Vec2::new(0.0, size * 0.15),
-            Vec2::new(body_w, body_h),
-        );
-        painter.rect_filled(body, egui::CornerRadius::same((size * 0.08) as u8), color);
-        let shackle_center = center + Vec2::new(0.0, -size * 0.12);
-        painter.circle_stroke(
-            shackle_center,
-            size * 0.24,
-            Stroke::new(size * 0.1, color),
-        );
+    pub fn lock(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+        let svg = LOCK_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        ui.add(egui::Image::from_bytes("bytes://lock.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
-
-    pub fn _unused(_p: egui::Color32) {}
+}
 }
 
 // ---------------------------------------------------------------------
@@ -516,6 +469,13 @@ impl TorBrowserBuilder {
                         .size(26.0)
                         .strong()
                         .color(palette::PURPLE),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("BETA")
+                        .size(14.0)
+                        .strong()
+                        .color(palette::GOLD),
                 );
             });
             ui.add_space((ui.available_width() - 120.0).max(0.0));
@@ -769,7 +729,7 @@ impl TorBrowserBuilder {
             let rect = btn.rect;
             let painter = ui.painter();
             let icon_center = egui::pos2(rect.center().x - 60.0, rect.center().y);
-            icons::download(painter, icon_center, 18.0, Color32::WHITE);
+            let _ = icons::download(ui, 18.0, Color32::WHITE);
             painter.text(
                 egui::pos2(rect.center().x - 40.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -900,7 +860,7 @@ impl TorBrowserBuilder {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::GOLD.gamma_multiply(0.12));
-            icons::lock(painter, rect.center(), 24.0, palette::GOLD);
+            let _ = icons::lock(ui, 24.0, palette::GOLD);
 
             ui.add_space(10.0);
             ui.label(
@@ -1036,7 +996,7 @@ impl TorBrowserBuilder {
             );
             let rect = continue_btn.rect;
             let painter = ui.painter();
-            icons::check(painter, egui::pos2(rect.center().x - 50.0, rect.center().y), 16.0, Color32::WHITE);
+            let _ = icons::check(ui, 16.0, Color32::WHITE);
             painter.text(
                 egui::pos2(rect.center().x - 30.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -1177,7 +1137,7 @@ impl TorBrowserBuilder {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::SUCCESS.gamma_multiply(0.12));
-            icons::check(painter, rect.center(), 26.0, palette::SUCCESS);
+            let _ = icons::check(ui, 26.0, palette::SUCCESS);
 
             ui.add_space(10.0);
             ui.label(
@@ -1236,7 +1196,7 @@ impl TorBrowserBuilder {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::ERROR.gamma_multiply(0.12));
-            icons::cross(painter, rect.center(), 24.0, palette::ERROR);
+            let _ = icons::cross(ui, 24.0, palette::ERROR);
 
             ui.add_space(10.0);
             ui.label(
@@ -1269,7 +1229,7 @@ impl TorBrowserBuilder {
         ui.horizontal(|ui| {
             ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            icons::lock(ui.painter(), rect.center(), 14.0, text_secondary);
+            let _ = icons::lock(ui, 14.0, text_secondary);
             ui.label(
                 RichText::new("Browse Privately. Explore Freely.")
                     .size(12.5)
@@ -1336,6 +1296,13 @@ impl TorBrowserBuilder {
                             .size(19.0)
                             .strong()
                             .color(text_primary),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("BETA")
+                            .size(12.0)
+                            .strong()
+                            .color(palette::GOLD),
                     );
                     ui.add_space(2.0);
                     ui.label(
@@ -1406,14 +1373,14 @@ impl TorBrowserBuilder {
     fn icon_label_button(
         ui: &mut egui::Ui,
         response: &egui::Response,
-        draw_icon: impl Fn(&egui::Painter, egui::Pos2, f32, Color32),
+        draw_icon: impl Fn(&mut egui::Ui, f32, Color32) -> egui::Response,
         label: &str,
         color: Color32,
     ) {
         let rect = response.rect;
-        let painter = ui.painter();
         let icon_center = egui::pos2(rect.center().x - 70.0, rect.center().y);
-        draw_icon(painter, icon_center, 16.0, color);
+        let _ = draw_icon(ui, 16.0, color);
+        let painter = ui.painter();
         painter.text(
             egui::pos2(rect.center().x - 50.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -1426,7 +1393,7 @@ impl TorBrowserBuilder {
 
 impl eframe::App for TorBrowserBuilder {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title("Tor Browser Installer".to_owned()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("Tor Browser Installer BETA".to_owned()));
         self.poll_worker(ctx);
         let bg = self.bg();
         egui::CentralPanel::default()

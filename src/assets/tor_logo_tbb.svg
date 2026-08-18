@@ -32,4 +32,8 @@
         <circle cx="0" cy="0" r="45" fill="#FFD700"/>
         <text x="0" y="0" text-anchor="middle" dominant-baseline="middle" font-family="Helvetica, Arial, sans-serif" font-size="24" font-weight="bold" fill="#8B4513">tbb</text>
     </g>
+    <g id="beta-badge" transform="translate(380, 420)">
+        <rect x="-30" y="-15" width="60" height="30" rx="5" fill="#FF6B35"/>
+        <text x="0" y="0" text-anchor="middle" dominant-baseline="middle" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#FFFFFF">BETA</text>
+    </g>
 </svg>
