@@ -257,7 +257,6 @@ mod icons {
         ui.add(egui::Image::from_bytes("bytes://lock.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 }
-}
 
 // ---------------------------------------------------------------------
 // Application state
