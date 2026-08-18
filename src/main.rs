@@ -1591,7 +1591,6 @@ fn install_from_exe(exe_path: &Path, install_dir: &Path) -> Result<PathBuf, Stri
 /// returning the first match. Used by the Linux and Windows install paths
 /// to locate the launcher inside an extracted/installed tree without
 /// depending on an exact directory layout.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn find_file(root: &Path, target: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(root).ok()?;
     let mut subdirs = Vec::new();
