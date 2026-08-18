@@ -228,32 +228,32 @@ mod icons {
     pub const LOCK_SVG: &str = include_str!("assets/icons/lock.svg");
 
     pub fn download(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = DOWNLOAD_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        let svg = DOWNLOAD_SVG.replace("currentColor", color.to_hex());
         ui.add(egui::Image::from_bytes("bytes://download.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn check(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = CHECK_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        let svg = CHECK_SVG.replace("currentColor", color.to_hex());
         ui.add(egui::Image::from_bytes("bytes://check.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn cross(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = CROSS_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        let svg = CROSS_SVG.replace("currentColor", color.to_hex());
         ui.add(egui::Image::from_bytes("bytes://cross.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn folder(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = FOLDER_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        let svg = FOLDER_SVG.replace("currentColor", color.to_hex());
         ui.add(egui::Image::from_bytes("bytes://folder.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn launch(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = LAUNCH_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        let svg = LAUNCH_SVG.replace("currentColor", color.to_hex());
         ui.add(egui::Image::from_bytes("bytes://launch.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 
     pub fn lock(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = LOCK_SVG.replace("currentColor", color.to_srgba().to_css_color_string());
+        let svg = LOCK_SVG.replace("currentColor", color.to_hex());
         ui.add(egui::Image::from_bytes("bytes://lock.svg", svg.as_bytes()).fit_to_exact_size(egui::vec2(size, size)))
     }
 }
@@ -726,10 +726,8 @@ impl TorBrowserBuilder {
                     .corner_radius(egui::CornerRadius::same(10)),
             );
             let rect = btn.rect;
-            let painter = ui.painter();
-            let icon_center = egui::pos2(rect.center().x - 60.0, rect.center().y);
             let _ = icons::download(ui, 18.0, Color32::WHITE);
-            painter.text(
+            ui.painter().text(
                 egui::pos2(rect.center().x - 40.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 "Download & Install Tor Browser",
@@ -857,9 +855,9 @@ impl TorBrowserBuilder {
         let app_path = app_path.to_path_buf();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+            let _ = icons::lock(ui, 24.0, palette::GOLD);
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::GOLD.gamma_multiply(0.12));
-            let _ = icons::lock(ui, 24.0, palette::GOLD);
 
             ui.add_space(10.0);
             ui.label(
@@ -994,9 +992,8 @@ impl TorBrowserBuilder {
                     .corner_radius(egui::CornerRadius::same(10)),
             );
             let rect = continue_btn.rect;
-            let painter = ui.painter();
             let _ = icons::check(ui, 16.0, Color32::WHITE);
-            painter.text(
+            ui.painter().text(
                 egui::pos2(rect.center().x - 30.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 "Continue",
@@ -1134,9 +1131,9 @@ impl TorBrowserBuilder {
         let app_path = app_path.to_path_buf();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+            let _ = icons::check(ui, 26.0, palette::SUCCESS);
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::SUCCESS.gamma_multiply(0.12));
-            let _ = icons::check(ui, 26.0, palette::SUCCESS);
 
             ui.add_space(10.0);
             ui.label(
@@ -1193,9 +1190,9 @@ impl TorBrowserBuilder {
         let text_secondary = self.text_secondary();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+            let _ = icons::cross(ui, 24.0, palette::ERROR);
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::ERROR.gamma_multiply(0.12));
-            let _ = icons::cross(ui, 24.0, palette::ERROR);
 
             ui.add_space(10.0);
             ui.label(
@@ -1377,10 +1374,8 @@ impl TorBrowserBuilder {
         color: Color32,
     ) {
         let rect = response.rect;
-        let icon_center = egui::pos2(rect.center().x - 70.0, rect.center().y);
         let _ = draw_icon(ui, 16.0, color);
-        let painter = ui.painter();
-        painter.text(
+        ui.painter().text(
             egui::pos2(rect.center().x - 50.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
