@@ -1,4 +1,5 @@
 # Tor Browser Installer
+[![GitHub Actions CI](https://github.com/reality-prod/tbi-rust/actions/workflows/rust.yml/badge.svg)](https://github.com/reality-prod/tbi-rust/actions/workflows/rust.yml/badge.svg)
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
 [![License: AGPL](https://img.shields.io/badge/license-AGPL-blue.svg)](LICENSE)
