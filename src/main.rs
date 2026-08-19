@@ -30,7 +30,7 @@
 //! download-windows-*.json.
 
 use eframe::egui;
-use egui::{Color32, RichText, Stroke};
+use egui::{Color32, Rect, RichText, Stroke};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -43,9 +43,9 @@ use openpgp::policy::StandardPolicy;
 
 /// This app's own version, shown in the About screen and sent as part of
 /// the HTTP User-Agent when talking to the Tor Project's release API.
-const APP_VERSION: &str = "0.2 BETA";
+const APP_VERSION: &str = "0.07";
 /// Credited in the About screen.
-const APP_AUTHOR: &str = "Ribhav Revalli";
+const APP_AUTHOR: &str = "Ribhav Sai Ramanuja Revalli";
 
 // ---------------------------------------------------------------------
 // Platform detection
@@ -218,43 +218,278 @@ impl InstallScope {
 // ---------------------------------------------------------------------
 
 mod icons {
-    use egui::Color32;
+    //! Every icon here is painted directly with `egui::Painter` — lines,
+    //! arcs, and circles built from primitives that ship with egui itself.
+    //! There are no external SVG files to go missing and no reliance on
+    //! glyphs being present in whatever font egui happens to load, so
+    //! nothing can turn into a "tofu box" (missing-glyph square) or a
+    //! blank space.
+    //!
+    //! Each function below is a direct transliteration of the matching
+    //! Feather-style SVG (24x24 viewBox, `stroke="currentColor"`,
+    //! `stroke-width="2"`) into `Painter` calls: every `M`/`L`/`H`/`V`/
+    //! `line`/`polyline` coordinate is mapped from the SVG's 0..24 space
+    //! onto whatever `Rect` the caller hands in via `p()`, so the shapes
+    //! match the original artwork rather than being freehand
+    //! approximations. Rounded corners in the source paths (the small
+    //! `a2 2 0 0 1 ...` arcs) are simplified to straight corners, which
+    //! is not visible at icon sizes.
+    //!
+    //! Each function takes the exact `Rect` to paint into and draws only
+    //! inside it — callers are expected to have already worked out where
+    //! that rect is (typically a button's own `response.rect`, or a rect
+    //! from a single `ui.allocate_exact_size` call). Painting into a rect
+    //! something else already allocated (rather than allocating a new,
+    //! unrelated one) is what keeps an icon glued to the button/circle it
+    //! belongs to.
 
-    pub const DOWNLOAD_SVG: &str = include_str!("assets/icons/download.svg");
-    pub const CHECK_SVG: &str = include_str!("assets/icons/check.svg");
-    pub const CROSS_SVG: &str = include_str!("assets/icons/cross.svg");
-    pub const FOLDER_SVG: &str = include_str!("assets/icons/folder.svg");
-    pub const LAUNCH_SVG: &str = include_str!("assets/icons/launch.svg");
-    pub const LOCK_SVG: &str = include_str!("assets/icons/lock.svg");
+    use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 
-    pub fn download(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = DOWNLOAD_SVG.replace("currentColor", &color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://download.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+    /// Maps a point in the source SVG's 0..24 coordinate space onto `rect`.
+    fn p(rect: Rect, x: f32, y: f32) -> Pos2 {
+        Pos2::new(
+            rect.left() + x / 24.0 * rect.width(),
+            rect.top() + y / 24.0 * rect.height(),
+        )
     }
 
-    pub fn check(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = CHECK_SVG.replace("currentColor", &color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://check.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+    fn stroke(rect: Rect, color: Color32) -> Stroke {
+        // stroke-width="2" on a 24-unit viewBox.
+        Stroke::new((rect.width() * (2.0 / 24.0)).max(1.4), color)
     }
 
-    pub fn cross(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = CROSS_SVG.replace("currentColor", &color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://cross.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+    /// Draws consecutive line segments through `pts`, open (not closed).
+    fn polyline(painter: &Painter, pts: &[Pos2], stroke: Stroke) {
+        for pair in pts.windows(2) {
+            painter.line_segment([pair[0], pair[1]], stroke);
+        }
     }
 
-    pub fn folder(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = FOLDER_SVG.replace("currentColor", &color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://folder.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+    fn arc_points(center: Pos2, radius: f32, start_deg: f32, end_deg: f32, segments: usize) -> Vec<Pos2> {
+        (0..=segments)
+            .map(|i| {
+                let t = start_deg + (end_deg - start_deg) * (i as f32 / segments as f32);
+                let rad = t.to_radians();
+                Pos2::new(center.x + radius * rad.cos(), center.y + radius * rad.sin())
+            })
+            .collect()
     }
 
-    pub fn launch(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = LAUNCH_SVG.replace("currentColor", &color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://launch.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+    /// download.svg — tray with a downward arrow.
+    pub fn download(painter: &Painter, rect: Rect, color: Color32) {
+        let s = stroke(rect, color);
+        // M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 (corners squared off)
+        polyline(
+            painter,
+            &[
+                p(rect, 21.0, 15.0),
+                p(rect, 21.0, 19.0),
+                p(rect, 19.0, 21.0),
+                p(rect, 5.0, 21.0),
+                p(rect, 3.0, 19.0),
+                p(rect, 3.0, 15.0),
+            ],
+            s,
+        );
+        // polyline points="7 10 12 15 17 10"
+        polyline(
+            painter,
+            &[p(rect, 7.0, 10.0), p(rect, 12.0, 15.0), p(rect, 17.0, 10.0)],
+            s,
+        );
+        // line x1=12 y1=15 x2=12 y2=3
+        painter.line_segment([p(rect, 12.0, 15.0), p(rect, 12.0, 3.0)], s);
     }
 
-    pub fn lock(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
-        let svg = LOCK_SVG.replace("currentColor", &color.to_hex());
-        ui.add(egui::Image::from_bytes("bytes://lock.svg", svg.into_bytes()).fit_to_exact_size(egui::vec2(size, size)))
+    /// check.svg — a checkmark.
+    pub fn check(painter: &Painter, rect: Rect, color: Color32) {
+        let s = stroke(rect, color);
+        // polyline points="20 6 9 17 4 12"
+        polyline(
+            painter,
+            &[p(rect, 20.0, 6.0), p(rect, 9.0, 17.0), p(rect, 4.0, 12.0)],
+            s,
+        );
+    }
+
+    /// cross.svg — an X mark.
+    pub fn cross(painter: &Painter, rect: Rect, color: Color32) {
+        let s = stroke(rect, color);
+        painter.line_segment([p(rect, 18.0, 6.0), p(rect, 6.0, 18.0)], s);
+        painter.line_segment([p(rect, 6.0, 6.0), p(rect, 18.0, 18.0)], s);
+    }
+
+    /// folder.svg — a folder-plus outline.
+    pub fn folder(painter: &Painter, rect: Rect, color: Color32) {
+        let s = stroke(rect, color);
+        // M22 19a..-2 2H4a..-2-2V5a..2-2h5l2 3h9a..2 2z (corners squared off)
+        let pts = [
+            p(rect, 22.0, 19.0),
+            p(rect, 20.0, 21.0),
+            p(rect, 4.0, 21.0),
+            p(rect, 2.0, 19.0),
+            p(rect, 2.0, 5.0),
+            p(rect, 4.0, 3.0),
+            p(rect, 9.0, 3.0),
+            p(rect, 11.0, 6.0),
+            p(rect, 20.0, 6.0),
+            p(rect, 22.0, 8.0),
+            p(rect, 22.0, 19.0),
+        ];
+        polyline(painter, &pts, s);
+        // line x1=12 y1=11 x2=12 y2=17 (the "+" stem)
+        painter.line_segment([p(rect, 12.0, 11.0), p(rect, 12.0, 17.0)], s);
+        // line x1=9 y1=14 x2=15 y2=14 (the "+" bar)
+        painter.line_segment([p(rect, 9.0, 14.0), p(rect, 15.0, 14.0)], s);
+    }
+
+    /// launch.svg — an arrow pointing right.
+    pub fn launch(painter: &Painter, rect: Rect, color: Color32) {
+        let s = stroke(rect, color);
+        // line x1=5 y1=12 x2=19 y2=12
+        painter.line_segment([p(rect, 5.0, 12.0), p(rect, 19.0, 12.0)], s);
+        // polyline points="12 5 19 12 12 19"
+        polyline(
+            painter,
+            &[p(rect, 12.0, 5.0), p(rect, 19.0, 12.0), p(rect, 12.0, 19.0)],
+            s,
+        );
+    }
+
+    /// lock.svg — a padlock.
+    pub fn lock(painter: &Painter, rect: Rect, color: Color32) {
+        let s = stroke(rect, color);
+        // rect x=3 y=11 width=18 height=11 rx=2 ry=2 (corners squared off)
+        let body = [
+            p(rect, 3.0, 11.0),
+            p(rect, 21.0, 11.0),
+            p(rect, 21.0, 22.0),
+            p(rect, 3.0, 22.0),
+            p(rect, 3.0, 11.0),
+        ];
+        polyline(painter, &body, s);
+        // M7 11V7a5 5 0 0 1 10 0v4 — shackle: down-segment, semicircle arc, down-segment
+        painter.line_segment([p(rect, 7.0, 11.0), p(rect, 7.0, 7.0)], s);
+        let center = p(rect, 12.0, 7.0);
+        let radius = 5.0 / 24.0 * rect.width();
+        let arc = arc_points(center, radius, 180.0, 360.0, 16);
+        painter.add(egui::Shape::line(arc, s));
+        painter.line_segment([p(rect, 17.0, 7.0), p(rect, 17.0, 11.0)], s);
+    }
+
+    /// beta.svg — an open box / package, used next to the "BETA" badge.
+    pub fn package(painter: &Painter, rect: Rect, color: Color32) {
+        let s = stroke(rect, color);
+        // M12 2L2 7l10 5 10-5-10-5z (closed top face)
+        let top = [
+            p(rect, 12.0, 2.0),
+            p(rect, 2.0, 7.0),
+            p(rect, 12.0, 12.0),
+            p(rect, 22.0, 7.0),
+            p(rect, 12.0, 2.0),
+        ];
+        polyline(painter, &top, s);
+        // M2 17l10 5 10-5
+        polyline(
+            painter,
+            &[p(rect, 2.0, 17.0), p(rect, 12.0, 22.0), p(rect, 22.0, 17.0)],
+            s,
+        );
+        // M2 12l10 5 10-5
+        polyline(
+            painter,
+            &[p(rect, 2.0, 12.0), p(rect, 12.0, 17.0), p(rect, 22.0, 12.0)],
+            s,
+        );
+    }
+
+    /// A circled "i" — used for the About button. Not from an SVG file;
+    /// there's no info-circle in the uploaded set, so this stays
+    /// procedurally drawn to match the same visual weight as the others.
+    pub fn info(painter: &Painter, rect: Rect, color: Color32) {
+        let s = Stroke::new((rect.width() * (2.0 / 24.0)).max(1.4), color);
+        let r = rect.width() * 0.40;
+        painter.circle_stroke(rect.center(), r, s);
+        let dot_r = (rect.width() * 0.06).max(1.2);
+        painter.circle_filled(
+            Pos2::new(rect.center().x, rect.center().y - r * 0.42),
+            dot_r,
+            color,
+        );
+        painter.line_segment(
+            [
+                Pos2::new(rect.center().x, rect.center().y - r * 0.05),
+                Pos2::new(rect.center().x, rect.center().y + r * 0.48),
+            ],
+            s,
+        );
+    }
+
+    /// A crescent moon — light-theme toggle indicator. `bg` is the color
+    /// behind the icon, used to "cut" the crescent out of a filled circle.
+    /// Not from an SVG file (none was provided for this), so it stays
+    /// procedurally drawn.
+    pub fn moon(painter: &Painter, rect: Rect, color: Color32, bg: Color32) {
+        let r = rect.width() * 0.34;
+        painter.circle_filled(rect.center(), r, color);
+        let cut_center = Pos2::new(rect.center().x + r * 0.55, rect.center().y - r * 0.32);
+        painter.circle_filled(cut_center, r * 0.88, bg);
+    }
+
+    /// A sun (circle with rays) — dark-theme toggle indicator. Not from
+    /// an SVG file, so it stays procedurally drawn.
+    pub fn sun(painter: &Painter, rect: Rect, color: Color32) {
+        let s = Stroke::new((rect.width() * (2.0 / 24.0)).max(1.4), color);
+        let r = rect.width() * 0.20;
+        painter.circle_stroke(rect.center(), r, s);
+        for i in 0..8 {
+            let angle = i as f32 * std::f32::consts::FRAC_PI_4;
+            let dir = Vec2::angled(angle);
+            let inner = rect.center() + dir * (r * 1.35);
+            let outer = rect.center() + dir * (r * 1.9);
+            painter.line_segment([inner, outer], s);
+        }
+    }
+
+    /// A small downward chevron ("expand"). Not from an SVG file.
+    pub fn chevron_down(painter: &Painter, rect: Rect, color: Color32) {
+        let s = Stroke::new((rect.width() * (2.0 / 24.0)).max(1.4), color);
+        let w = rect.width();
+        let h = rect.height();
+        let p1 = Pos2::new(rect.left() + w * 0.20, rect.top() + h * 0.35);
+        let p2 = Pos2::new(rect.center().x, rect.top() + h * 0.65);
+        let p3 = Pos2::new(rect.right() - w * 0.20, rect.top() + h * 0.35);
+        painter.line_segment([p1, p2], s);
+        painter.line_segment([p2, p3], s);
+    }
+
+    /// A small rightward chevron ("collapsed"). Not from an SVG file.
+    pub fn chevron_right(painter: &Painter, rect: Rect, color: Color32) {
+        let s = Stroke::new((rect.width() * (2.0 / 24.0)).max(1.4), color);
+        let w = rect.width();
+        let h = rect.height();
+        let p1 = Pos2::new(rect.left() + w * 0.32, rect.top() + h * 0.18);
+        let p2 = Pos2::new(rect.right() - w * 0.32, rect.center().y);
+        let p3 = Pos2::new(rect.left() + w * 0.32, rect.bottom() - h * 0.18);
+        painter.line_segment([p1, p2], s);
+        painter.line_segment([p2, p3], s);
+    }
+
+    /// Allocates a fresh square of layout space and paints `draw` into it.
+    /// Use this only for a *standalone* icon that owns its own spot in the
+    /// layout (e.g. sitting alone in a horizontal row). Never use this for
+    /// an icon that belongs inside a rect something else already
+    /// allocated (a button, a status circle) — paint directly into that
+    /// rect instead, or the icon will land in the wrong place.
+    pub fn standalone(
+        ui: &mut egui::Ui,
+        size: f32,
+        draw: impl FnOnce(&Painter, Rect, Color32),
+        color: Color32,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+        draw(&ui.painter(), rect, color);
+        response
     }
 }
 
@@ -470,35 +705,44 @@ impl TorBrowserBuilder {
                         .color(palette::PURPLE),
                 );
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new("BETA")
-                        .size(14.0)
-                        .strong()
-                        .color(palette::GOLD),
-                );
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+                    icons::package(&ui.painter(), icon_rect, palette::GOLD);
+                    ui.add_space(3.0);
+                    ui.label(
+                        RichText::new("BETA")
+                            .size(14.0)
+                            .strong()
+                            .color(palette::GOLD),
+                    );
+                });
             });
             ui.add_space((ui.available_width() - 120.0).max(0.0));
-            let about_btn = ui.add(
-                egui::Button::new(
-                    RichText::new("\u{24D8}").size(18.0).color(self.text_primary()),
-                )
-                .fill(self.surface())
-                .stroke(Stroke::new(1.0_f32, self.border()))
-                .corner_radius(egui::CornerRadius::same(8)),
+            let about_btn = ui.add_sized(
+                [36.0, 36.0],
+                egui::Button::new("")
+                    .fill(self.surface())
+                    .stroke(Stroke::new(1.0_f32, self.border()))
+                    .corner_radius(egui::CornerRadius::same(8)),
             );
+            icons::info(&ui.painter(), about_btn.rect.shrink(9.0), self.text_primary());
             if about_btn.clicked() {
                 self.show_about = true;
             }
             ui.add_space(8.0);
-            let label = if self.theme == Theme::Light { "\u{263E}" } else { "\u{2600}" };
-            let theme_btn = ui.add(
-                egui::Button::new(
-                    RichText::new(label).size(18.0).color(self.text_primary()),
-                )
-                .fill(self.surface())
-                .stroke(Stroke::new(1.0_f32, self.border()))
-                .corner_radius(egui::CornerRadius::same(8)),
+            let theme_btn = ui.add_sized(
+                [36.0, 36.0],
+                egui::Button::new("")
+                    .fill(self.surface())
+                    .stroke(Stroke::new(1.0_f32, self.border()))
+                    .corner_radius(egui::CornerRadius::same(8)),
             );
+            let icon_rect = theme_btn.rect.shrink(8.0);
+            match self.theme {
+                Theme::Light => icons::moon(&ui.painter(), icon_rect, self.text_primary(), self.surface()),
+                Theme::Dark => icons::sun(&ui.painter(), icon_rect, self.text_primary()),
+            }
             if theme_btn.clicked() {
                 self.theme = match self.theme {
                     Theme::Light => Theme::Dark,
@@ -561,11 +805,10 @@ impl TorBrowserBuilder {
         ui.separator();
         ui.add_space(6.0);
 
-        let arrow = if self.show_command_log { "\u{25BE}" } else { "\u{25B8}" };
         let toggle = ui.add(
             egui::Button::new(
                 RichText::new(format!(
-                    "{arrow} View commands ({} run)",
+                    "   View commands ({} run)",
                     self.command_log.len()
                 ))
                 .size(12.5)
@@ -574,6 +817,15 @@ impl TorBrowserBuilder {
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::NONE),
         );
+        let chevron_rect = Rect::from_center_size(
+            egui::pos2(toggle.rect.left() + 9.0, toggle.rect.center().y),
+            egui::vec2(11.0, 11.0),
+        );
+        if self.show_command_log {
+            icons::chevron_down(&ui.painter(), chevron_rect, text_secondary);
+        } else {
+            icons::chevron_right(&ui.painter(), chevron_rect, text_secondary);
+        }
         if toggle.clicked() {
             self.show_command_log = !self.show_command_log;
         }
@@ -726,9 +978,13 @@ impl TorBrowserBuilder {
                     .corner_radius(egui::CornerRadius::same(10)),
             );
             let rect = btn.rect;
-            let _ = icons::download(ui, 18.0, Color32::WHITE);
+            let icon_rect = Rect::from_center_size(
+                egui::pos2(rect.center().x - 92.0, rect.center().y),
+                egui::vec2(18.0, 18.0),
+            );
+            icons::download(&ui.painter(), icon_rect, Color32::WHITE);
             ui.painter().text(
-                egui::pos2(rect.center().x - 40.0, rect.center().y),
+                egui::pos2(rect.center().x - 74.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 "Download & Install Tor Browser",
                 egui::FontId::proportional(15.5),
@@ -855,9 +1111,9 @@ impl TorBrowserBuilder {
         let app_path = app_path.to_path_buf();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-            let _ = icons::lock(ui, 24.0, palette::GOLD);
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::GOLD.gamma_multiply(0.12));
+            icons::lock(&painter, Rect::from_center_size(rect.center(), egui::vec2(24.0, 24.0)), palette::GOLD);
 
             ui.add_space(10.0);
             ui.label(
@@ -992,7 +1248,11 @@ impl TorBrowserBuilder {
                     .corner_radius(egui::CornerRadius::same(10)),
             );
             let rect = continue_btn.rect;
-            let _ = icons::check(ui, 16.0, Color32::WHITE);
+            let icon_rect = Rect::from_center_size(
+                egui::pos2(rect.center().x - 48.0, rect.center().y),
+                egui::vec2(16.0, 16.0),
+            );
+            icons::check(&ui.painter(), icon_rect, Color32::WHITE);
             ui.painter().text(
                 egui::pos2(rect.center().x - 30.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -1131,9 +1391,9 @@ impl TorBrowserBuilder {
         let app_path = app_path.to_path_buf();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-            let _ = icons::check(ui, 26.0, palette::SUCCESS);
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::SUCCESS.gamma_multiply(0.12));
+            icons::check(&painter, Rect::from_center_size(rect.center(), egui::vec2(26.0, 26.0)), palette::SUCCESS);
 
             ui.add_space(10.0);
             ui.label(
@@ -1190,9 +1450,9 @@ impl TorBrowserBuilder {
         let text_secondary = self.text_secondary();
         ui.vertical_centered(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-            let _ = icons::cross(ui, 24.0, palette::ERROR);
             let painter = ui.painter();
             painter.circle_filled(rect.center(), 28.0, palette::ERROR.gamma_multiply(0.12));
+            icons::cross(&painter, Rect::from_center_size(rect.center(), egui::vec2(24.0, 24.0)), palette::ERROR);
 
             ui.add_space(10.0);
             ui.label(
@@ -1224,8 +1484,9 @@ impl TorBrowserBuilder {
         let text_secondary = self.text_secondary();
         ui.horizontal(|ui| {
             ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
-            let (_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            let _ = icons::lock(ui, 14.0, text_secondary);
+            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            icons::lock(&ui.painter(), icon_rect.shrink(1.0), text_secondary);
+            ui.add_space(4.0);
             ui.label(
                 RichText::new("Browse Privately. Explore Freely.")
                     .size(12.5)
@@ -1294,12 +1555,19 @@ impl TorBrowserBuilder {
                             .color(text_primary),
                     );
                     ui.add_space(2.0);
-                    ui.label(
-                        RichText::new("BETA")
-                            .size(12.0)
-                            .strong()
-                            .color(palette::GOLD),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 46.0).max(0.0) / 2.0);
+                        let (icon_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        icons::package(&ui.painter(), icon_rect, palette::GOLD);
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new("BETA")
+                                .size(12.0)
+                                .strong()
+                                .color(palette::GOLD),
+                        );
+                    });
                     ui.add_space(2.0);
                     ui.label(
                         RichText::new(format!("Version {APP_VERSION}"))
@@ -1310,7 +1578,7 @@ impl TorBrowserBuilder {
                     ui.label(
                         RichText::new(
                             "Downloads, verifies, and installs Tor Browser straight from the \
-                             Tor Project — nothing else bundled, nothing else phoning home.",
+                             Tor Project.",
                         )
                         .size(13.5)
                         .color(text_primary),
@@ -1369,17 +1637,32 @@ impl TorBrowserBuilder {
     fn icon_label_button(
         ui: &mut egui::Ui,
         response: &egui::Response,
-        draw_icon: impl Fn(&mut egui::Ui, f32, Color32) -> egui::Response,
+        draw_icon: impl Fn(&egui::Painter, Rect, Color32),
         label: &str,
         color: Color32,
     ) {
         let rect = response.rect;
-        let _ = draw_icon(ui, 16.0, color);
+        // Measure the label so the icon+text pair can be centered as a
+        // unit, rather than pinned at a fixed offset that only happened
+        // to look right for one particular label string.
+        let font_id = egui::FontId::proportional(14.5);
+        let galley = ui.painter().layout_no_wrap(label.to_string(), font_id.clone(), color);
+        let icon_size = 16.0;
+        let gap = 10.0;
+        let total_width = icon_size + gap + galley.size().x;
+        let start_x = rect.center().x - total_width / 2.0;
+
+        let icon_rect = Rect::from_center_size(
+            egui::pos2(start_x + icon_size / 2.0, rect.center().y),
+            egui::vec2(icon_size, icon_size),
+        );
+        draw_icon(&ui.painter(), icon_rect, color);
+
         ui.painter().text(
-            egui::pos2(rect.center().x - 50.0, rect.center().y),
+            egui::pos2(start_x + icon_size + gap, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(14.5),
+            font_id,
             color,
         );
     }
@@ -1416,7 +1699,7 @@ fn run_install_pipeline(
         log_line(
             &tx,
             format!(
-                "Install scope: all users ({} — sudo)",
+                "Install scope: all users ({}  -  sudo)",
                 install_dir.display()
             ),
         );
@@ -1486,7 +1769,7 @@ fn run_install_pipeline(
             Ok(actual) if actual.eq_ignore_ascii_case(expected) => {}
             Ok(actual) => {
                 send_state(AppState::Error(format!(
-                    "Checksum mismatch — expected {expected}, got {actual}. \
+                    "Checksum mismatch  -  expected {expected}, got {actual}. \
                      The download will not be installed."
                 )));
                 return;
@@ -1851,7 +2134,7 @@ fn run_privileged_shell(
     }
     if lower.contains("a password is required") || lower.contains("no tty present") {
         return Err(
-            "sudo could not prompt for a password in this environment — this usually means \
+            "sudo could not prompt for a password in this environment  -  this usually means \
              the account isn't allowed to use sudo, or a password wasn't entered"
                 .to_string(),
         );
@@ -2237,7 +2520,7 @@ fn install_from_dmg(
             install_from_mounted_dmg(&mount_point, install_dir, scope, password, &send_stage, tx)
         }
         Err(attach_err) => {
-            send_stage("Disk image would not attach — extracting without mounting...");
+            send_stage("Disk image would not attach  -  extracting without mounting...");
             install_via_7z_extraction(dmg_path, install_dir, scope, password, &send_stage, tx)
                 .map_err(|extract_err| {
                     format!(
@@ -2319,7 +2602,7 @@ fn install_via_7z_extraction(
 
     let seven_zip_bin = find_seven_zip_binary().ok_or_else(|| {
         "no 7-Zip binary (7zz/7z/7za) is installed to extract the disk image without mounting \
-         it — install one with `brew install sevenzip` (or `brew install p7zip`) and try again"
+         it  -  install one with `brew install sevenzip` (or `brew install p7zip`) and try again"
             .to_string()
     })?;
 
@@ -2522,7 +2805,7 @@ fn install_from_exe(exe_path: &Path, install_dir: &Path) -> Result<PathBuf, Stri
     if !status.success() {
         return Err(
             "the Tor Browser installer exited with an error (silent-install flags may not be \
-             supported by this release — try running the downloaded .exe manually)"
+             supported by this release - try running the downloaded .exe manually)"
                 .to_string(),
         );
     }
