@@ -27,7 +27,7 @@ jobs:
 
   build-linux:
     name: Build (Linux)
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
 
   build-windows:
     name: Build (Windows)
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +83,7 @@ jobs:
 
   build-macos:
     name: Build (macOS)
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     runs-on: macos-latest
     strategy:
       matrix:
@@ -156,7 +156,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -179,5 +179,8 @@ jobs:
           files: out/*
           draft: false
           generate_release_notes: true
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest master build' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
